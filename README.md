@@ -94,49 +94,6 @@ PYTHONPATH=src python3 -m indextrack.cli --ui --ui-host 127.0.0.1 --ui-port 8000
 停止 UI：
 - 回到终端按 `Ctrl+C`
 
-## 免费公网部署（Render，推荐）
-
-项目已补齐部署文件：`Dockerfile`、`render.yaml`、`scripts/start_web.py`、`requirements.txt`。  
-你现在可以直接部署到 Render（若你的账号当前可用 free web 实例，优先选 free）。
-
-### 中文部署步骤
-
-1. 把当前项目推送到你的 GitHub 仓库。  
-2. 打开 Render，选择 `New +` -> `Blueprint`，连接这个仓库。  
-3. Render 会自动读取根目录的 `render.yaml`。  
-4. 部署完成后，打开：
-   - `https://<你的服务域名>/`
-5. 健康检查地址：
-   - `https://<你的服务域名>/healthz`
-
-可选环境变量（在 Render 控制台里配置）：
-- `INDEXTRACK_DEPLOY_MODEL=quantile`（或 `legacy`）
-- `INDEXTRACK_DEPLOY_PERIOD=1Y`
-- `INDEXTRACK_TIMEZONE=America/New_York`
-- `INDEXTRACK_DB_PATH=.data/indextrack.db`
-
-本地先验收 Docker（可选）：
-```bash
-docker build -t indextrack-web .
-docker run --rm -p 8000:7860 indextrack-web
-```
-打开：`http://127.0.0.1:8000/`
-
-### English Deployment Steps
-
-1. Push this project to your GitHub repository.  
-2. In Render, click `New +` -> `Blueprint`, then connect the repo.  
-3. Render will auto-detect `render.yaml` in the root directory.  
-4. After deploy, open:
-   - `https://<your-service-domain>/`
-5. Health check endpoint:
-   - `https://<your-service-domain>/healthz`
-
-Optional environment variables:
-- `INDEXTRACK_DEPLOY_MODEL=quantile` (or `legacy`)
-- `INDEXTRACK_DEPLOY_PERIOD=1Y`
-- `INDEXTRACK_TIMEZONE=America/New_York`
-- `INDEXTRACK_DB_PATH=.data/indextrack.db`
 
 ## 常用命令
 
