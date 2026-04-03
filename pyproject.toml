@@ -1,0 +1,14 @@
+[project]
+name = "indextrack"
+version = "0.1.0"
+description = "CLI tool for SP500 and Nasdaq Composite trend analysis"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+]
+
+[dependency-groups]
+dev = []
+
+[tool.uv]
+package = false
