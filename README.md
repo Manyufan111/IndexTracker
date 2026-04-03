@@ -8,7 +8,7 @@ IndexTrack 是一个本地工具，可分析 `S&P 500` 与 `Nasdaq Composite`，
 
 ### 1. 进入项目目录
 ```bash
-cd /Users/nickge/Documents/CODE/Project/IndexTrack
+cd /Users/..
 ```
 
 ### 2. 准备环境（只需首次）
