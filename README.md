@@ -118,7 +118,7 @@ PYTHONPATH=src python3 -m indextrack.cli --ui --ui-host 127.0.0.1 --ui-port 8000
 本地先验收 Docker（可选）：
 ```bash
 docker build -t indextrack-web .
-docker run --rm -p 8000:8000 indextrack-web
+docker run --rm -p 8000:7860 indextrack-web
 ```
 打开：`http://127.0.0.1:8000/`
 

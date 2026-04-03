@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app/src
 ENV HOST=0.0.0.0
-ENV PORT=8000
+ENV PORT=7860
 
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
@@ -18,6 +18,6 @@ COPY pyproject.toml /app/pyproject.toml
 
 RUN mkdir -p /app/.data
 
-EXPOSE 8000
+EXPOSE 7860
 
 CMD ["python3", "scripts/start_web.py"]

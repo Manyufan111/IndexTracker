@@ -16,7 +16,7 @@ def _read_env(name: str, default: str) -> str:
 
 def _build_args() -> list[str]:
     host = _read_env("HOST", "0.0.0.0")
-    port = _read_env("PORT", "8000")
+    port = _read_env("PORT", "7860")
     period = _read_env("INDEXTRACK_DEPLOY_PERIOD", "1Y")
     model = _read_env("INDEXTRACK_DEPLOY_MODEL", "quantile")
     db_path = _read_env("INDEXTRACK_DB_PATH", ".data/indextrack.db")
