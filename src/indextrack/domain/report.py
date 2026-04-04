@@ -21,13 +21,13 @@ TREND_LABELS_ZH = {
 }
 
 DISPLAY_LABELS_ZH = {
-    "strong_up": "上行",
-    "mild_up": "偏上",
-    "uncertain": "不确定",
-    "mild_down": "偏下",
-    "strong_down": "下行",
-    "high-confidence up": "上行",
-    "high-confidence down": "下行",
+    "strong_up": "明确看多",
+    "mild_up": "偏多但置信一般",
+    "uncertain": "中性/不确定",
+    "mild_down": "偏空但置信一般",
+    "strong_down": "明确看空",
+    "high-confidence up": "明确看多",
+    "high-confidence down": "明确看空",
 }
 
 @dataclass(frozen=True)

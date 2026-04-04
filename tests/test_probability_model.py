@@ -128,6 +128,36 @@ class ProbabilityModelTests(unittest.TestCase):
         self.assertGreaterEqual(float(up[0]), 0.0)
         self.assertTrue(np.isfinite(mu[0]))
 
+    def test_piecewise_quantile_mapping_outputs_valid_probs(self) -> None:
+        quantile_predictions = {
+            0.05: np.asarray([-0.030], dtype=float),
+            0.10: np.asarray([-0.020], dtype=float),
+            0.15: np.asarray([-0.012], dtype=float),
+            0.25: np.asarray([-0.006], dtype=float),
+            0.50: np.asarray([0.004], dtype=float),
+            0.75: np.asarray([0.018], dtype=float),
+            0.85: np.asarray([0.024], dtype=float),
+            0.90: np.asarray([0.028], dtype=float),
+            0.95: np.asarray([0.036], dtype=float),
+        }
+        down, flat, up, mu, sigma = quantiles_to_raw_probabilities(
+            q10=quantile_predictions[0.10],
+            q50=quantile_predictions[0.50],
+            q90=quantile_predictions[0.90],
+            threshold_up=np.asarray([0.010], dtype=float),
+            threshold_down=np.asarray([-0.010], dtype=float),
+            sigma_floor=0.004,
+            quantile_predictions=quantile_predictions,
+            quantile_levels=tuple(sorted(quantile_predictions.keys())),
+            mapping_mode="piecewise",
+        )
+        self.assertAlmostEqual(float(down[0] + flat[0] + up[0]), 1.0, places=6)
+        self.assertGreaterEqual(float(down[0]), 0.0)
+        self.assertGreaterEqual(float(flat[0]), 0.0)
+        self.assertGreaterEqual(float(up[0]), 0.0)
+        self.assertTrue(np.isfinite(mu[0]))
+        self.assertTrue(np.isfinite(sigma[0]))
+
     def test_backtest_contains_calibration_report(self) -> None:
         candles = _build_synthetic_candles()
         model = MarketProbabilityModel().fit(candles)

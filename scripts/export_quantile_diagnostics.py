@@ -9,7 +9,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -34,6 +34,7 @@ from indextrack.domain.probability.probability_mapper import (
     blend_calibrated_probabilities,
     calibrate_and_constrain,
     quantiles_to_raw_probabilities,
+    refine_raw_probabilities,
 )
 from indextrack.domain.probability.quantile_model import (
     QuantileLinearRegressor,
@@ -49,18 +50,21 @@ from indextrack.infra.repository.sqlite_repo import SQLiteRepository
 HORIZONS = ("short", "mid", "long")
 LABEL_TO_NAME = {LABEL_DOWN: "down", LABEL_FLAT: "flat", LABEL_UP: "up"}
 DISPLAY_HEADLINE_MAP = {
-    "strong_up": "上行",
-    "mild_up": "偏上",
-    "uncertain": "不确定",
-    "mild_down": "偏下",
-    "strong_down": "下行",
+    "strong_up": "明确看多",
+    "mild_up": "偏多但置信一般",
+    "uncertain": "中性/不确定",
+    "mild_down": "偏空但置信一般",
+    "strong_down": "明确看空",
 }
 WARNING_MESSAGE_MAP = {
     "direction_cap_up": "方向概率触发上限压缩，已降低极端化输出。",
     "direction_cap_down": "方向概率触发下限压缩，已降低极端化输出。",
     "regime_shift_shrink": "检测到市场状态漂移，已自动收缩置信度。",
     "high_vol_uncertain_boost": "当前高波动环境，不确定权重已提升。",
+    "uncertain_ceiling_applied": "不确定概率触发上限约束，已回补到方向概率。",
+    "binary_overcorrection_shrink": "检测到方向校准过度翻转，已回拉到更稳健区间。",
     "cross_horizon_conflict_shrink": "中长期信号冲突，已执行跨周期降置信处理。",
+    "display_top1_guard_revert": "展示层触发排序保护，已回退到原始方向排序。",
 }
 
 
@@ -73,6 +77,10 @@ def main() -> int:
     parser.add_argument("--output-dir", default=".data/diagnostics")
     parser.add_argument("--recent-rows", type=int, default=12)
     parser.add_argument("--short-extreme-limit", type=int, default=20)
+    parser.add_argument("--short-v2-min-count", type=int, default=20)
+    parser.add_argument("--short-v2-acc-thresh", type=float, default=0.05)
+    parser.add_argument("--short-v2-logloss-thresh", type=float, default=0.03)
+    parser.add_argument("--short-v2-flip-thresh", type=float, default=0.20)
     args = parser.parse_args()
 
     runtime = load_runtime_config()
@@ -114,6 +122,15 @@ def main() -> int:
         recent_rows=max(args.recent_rows, 5),
         short_extreme_limit=max(args.short_extreme_limit, 1),
     )
+    short_v2_exports = _build_short_guard_v2_exports(
+        short_detail=diagnostics["horizon_details"]["short"],
+        feature_matrix=ProbabilityFeatureEngine().transform(outcome.candles),
+        symbol=args.symbol,
+        min_count=max(args.short_v2_min_count, 1),
+        acc_thresh=float(args.short_v2_acc_thresh),
+        logloss_thresh=float(args.short_v2_logloss_thresh),
+        flip_thresh=float(args.short_v2_flip_thresh),
+    )
 
     now_tag = datetime.now(timezone).strftime("%Y%m%d_%H%M%S")
     output_dir = Path(args.output_dir)
@@ -122,11 +139,17 @@ def main() -> int:
     summary_path = output_dir / f"{args.symbol.lower()}_quantile_summary_{now_tag}.csv"
     detail_path = output_dir / f"{args.symbol.lower()}_quantile_detailed_report_{now_tag}.md"
     sample_path = output_dir / f"{args.symbol.lower()}_quantile_sample_predictions_{now_tag}.csv"
+    short_v2_samples_path = output_dir / f"{args.symbol.lower()}_short_subset_samples_{now_tag}.csv"
+    short_v2_bucket_path = output_dir / f"{args.symbol.lower()}_short_subset_bucket_report_{now_tag}.csv"
+    short_v2_candidates_path = output_dir / f"{args.symbol.lower()}_short_guard_v2_candidates_{now_tag}.csv"
     json_path = output_dir / f"{args.symbol.lower()}_quantile_diagnostics_{now_tag}.json"
     ablation_path = output_dir / f"{args.symbol.lower()}_quantile_ablation_{now_tag}.csv"
 
     _write_summary_csv(summary_path, diagnostics["summary_rows"])
     _write_sample_csv(sample_path, diagnostics["sample_rows"])
+    _write_short_v2_samples_csv(short_v2_samples_path, short_v2_exports["sample_rows"])
+    _write_short_v2_bucket_csv(short_v2_bucket_path, short_v2_exports["bucket_rows"])
+    _write_short_v2_candidates_csv(short_v2_candidates_path, short_v2_exports["candidate_rows"])
     _write_ablation_csv(ablation_path, diagnostics["ablation_rows"])
     _write_json(
         json_path,
@@ -144,6 +167,7 @@ def main() -> int:
             },
             "summary_rows": diagnostics["summary_rows"],
             "horizon_details": diagnostics["horizon_details"],
+            "short_guard_v2": short_v2_exports,
             "ablation": diagnostics["ablation"],
             "ablation_rows": diagnostics["ablation_rows"],
             "generated_at": datetime.now(timezone).isoformat(),
@@ -158,6 +182,9 @@ def main() -> int:
         diagnostics=diagnostics,
         summary_path=summary_path,
         sample_path=sample_path,
+        short_v2_samples_path=short_v2_samples_path,
+        short_v2_bucket_path=short_v2_bucket_path,
+        short_v2_candidates_path=short_v2_candidates_path,
         json_path=json_path,
         ablation_path=ablation_path,
     )
@@ -171,6 +198,9 @@ def main() -> int:
             "summary": summary_path,
             "detailed": detail_path,
             "samples": sample_path,
+            "short_v2_samples": short_v2_samples_path,
+            "short_v2_bucket": short_v2_bucket_path,
+            "short_v2_candidates": short_v2_candidates_path,
             "json": json_path,
             "ablation": ablation_path,
             "generated_at": datetime.now(timezone).isoformat(),
@@ -184,6 +214,9 @@ def main() -> int:
     print(f"- summary: {summary_path}")
     print(f"- detailed report: {detail_path}")
     print(f"- sample predictions csv: {sample_path}")
+    print(f"- short v2 samples csv: {short_v2_samples_path}")
+    print(f"- short v2 bucket report csv: {short_v2_bucket_path}")
+    print(f"- short v2 candidates csv: {short_v2_candidates_path}")
     print(f"- diagnostics json: {json_path}")
     print(f"- ablation csv: {ablation_path}")
     print(f"- latest index: {latest_index_path}")
@@ -263,6 +296,11 @@ def _evaluate_one_horizon(
     split_cfg = config.split
     mapper_cfg: ProbabilityMapperConfig = config.mapper
     horizon_days = {"short": 5, "mid": 20, "long": 60}[horizon]
+    quantile_levels = mapper_cfg.normalized_quantile_levels()
+    q10_level = _nearest_quantile_level_export(quantile_levels, 0.10)
+    q50_level = _nearest_quantile_level_export(quantile_levels, 0.50)
+    q90_level = _nearest_quantile_level_export(quantile_levels, 0.90)
+    mapping_mode = mapper_cfg.normalized_raw_prob_mapping_mode()
 
     n_total = int(global_indices.shape[0])
     test_size = _choose_test_size(n_total, split_cfg.min_train_size, split_cfg.min_valid_size)
@@ -287,21 +325,25 @@ def _evaluate_one_horizon(
     vol_test = feature_matrix.hist_vol_20[test_global]
 
     oof_raw = np.full((x_dev.shape[0], 3), np.nan, dtype=float)
-    oof_q10 = np.full(x_dev.shape[0], np.nan, dtype=float)
-    oof_q50 = np.full(x_dev.shape[0], np.nan, dtype=float)
-    oof_q90 = np.full(x_dev.shape[0], np.nan, dtype=float)
+    oof_quantiles: dict[float, np.ndarray] = {
+        level: np.full(x_dev.shape[0], np.nan, dtype=float)
+        for level in quantile_levels
+    }
     oof_sigma = np.full(x_dev.shape[0], np.nan, dtype=float)
     oof_mu = np.full(x_dev.shape[0], np.nan, dtype=float)
     oof_seen = np.zeros(x_dev.shape[0], dtype=bool)
 
     for train_idx, valid_idx in expanding_time_series_splits(x_dev.shape[0], split_cfg):
-        q10_model = QuantileLinearRegressor(0.10, config.quantile).fit(x_dev[train_idx], y_reg_dev[train_idx])
-        q50_model = QuantileLinearRegressor(0.50, config.quantile).fit(x_dev[train_idx], y_reg_dev[train_idx])
-        q90_model = QuantileLinearRegressor(0.90, config.quantile).fit(x_dev[train_idx], y_reg_dev[train_idx])
-
-        q10_pred = q10_model.predict(x_dev[valid_idx])
-        q50_pred = q50_model.predict(x_dev[valid_idx])
-        q90_pred = q90_model.predict(x_dev[valid_idx])
+        fold_predictions: dict[float, np.ndarray] = {}
+        for level in quantile_levels:
+            model = QuantileLinearRegressor(level, config.quantile).fit(
+                x_dev[train_idx],
+                y_reg_dev[train_idx],
+            )
+            fold_predictions[level] = model.predict(x_dev[valid_idx])
+        q10_pred = fold_predictions[q10_level]
+        q50_pred = fold_predictions[q50_level]
+        q90_pred = fold_predictions[q90_level]
         down_raw, flat_raw, up_raw, mu, sigma = quantiles_to_raw_probabilities(
             q10=q10_pred,
             q50=q50_pred,
@@ -309,12 +351,20 @@ def _evaluate_one_horizon(
             threshold_up=threshold_up_dev[valid_idx],
             threshold_down=threshold_down_dev[valid_idx],
             sigma_floor=mapper_cfg.sigma_floor(horizon_days),
+            quantile_predictions=fold_predictions,
+            quantile_levels=quantile_levels,
+            mapping_mode=mapping_mode,
             eps=mapper_cfg.eps,
         )
-        oof_raw[valid_idx] = np.column_stack([down_raw, flat_raw, up_raw])
-        oof_q10[valid_idx] = q10_pred
-        oof_q50[valid_idx] = q50_pred
-        oof_q90[valid_idx] = q90_pred
+        raw_fold = np.column_stack([down_raw, flat_raw, up_raw])
+        raw_fold = refine_raw_probabilities(
+            probs=raw_fold,
+            horizon_days=horizon_days,
+            config=mapper_cfg,
+        )
+        oof_raw[valid_idx] = raw_fold
+        for level, values in fold_predictions.items():
+            oof_quantiles[level][valid_idx] = values
         oof_sigma[valid_idx] = sigma
         oof_mu[valid_idx] = mu
         oof_seen[valid_idx] = True
@@ -371,6 +421,15 @@ def _evaluate_one_horizon(
         max_shift=max_shift,
         eps=mapper_cfg.eps,
     )
+    valid_guard, valid_trigger_mask = _apply_short_guard_export(
+        raw_probs=valid_raw,
+        calibrated_probs=valid_cal,
+        mu=oof_mu[oof_mask],
+        sigma=oof_sigma[oof_mask],
+        horizon_days=horizon_days,
+        mapper_cfg=mapper_cfg,
+        eps=mapper_cfg.eps,
+    )
 
     regime_dev, vol_cutoffs = regime_from_vol(
         vol_dev,
@@ -397,21 +456,26 @@ def _evaluate_one_horizon(
     else:
         valid_final = calibrate_and_constrain(
             raw_probs=valid_raw,
-            calibrated_probs=valid_cal,
+            calibrated_probs=valid_guard,
             base_probs=base_probs,
             mu=oof_mu[oof_mask],
             sigma=oof_sigma[oof_mask],
             lambda_h=lambda_h,
+            horizon_days=horizon_days,
+            regime_shift_score=0.0,
             regimes=regime_valid,
             config=mapper_cfg,
         )
 
-    q10_full = QuantileLinearRegressor(0.10, config.quantile).fit(x_dev, y_reg_dev)
-    q50_full = QuantileLinearRegressor(0.50, config.quantile).fit(x_dev, y_reg_dev)
-    q90_full = QuantileLinearRegressor(0.90, config.quantile).fit(x_dev, y_reg_dev)
-    q10_test = q10_full.predict(x_test)
-    q50_test = q50_full.predict(x_test)
-    q90_test = q90_full.predict(x_test)
+    full_models: dict[float, QuantileLinearRegressor] = {}
+    test_quantiles: dict[float, np.ndarray] = {}
+    for level in quantile_levels:
+        model = QuantileLinearRegressor(level, config.quantile).fit(x_dev, y_reg_dev)
+        full_models[level] = model
+        test_quantiles[level] = model.predict(x_test)
+    q10_test = test_quantiles[q10_level]
+    q50_test = test_quantiles[q50_level]
+    q90_test = test_quantiles[q90_level]
     down_raw_test, flat_raw_test, up_raw_test, mu_test, sigma_test = quantiles_to_raw_probabilities(
         q10=q10_test,
         q50=q50_test,
@@ -419,9 +483,17 @@ def _evaluate_one_horizon(
         threshold_up=threshold_up_test,
         threshold_down=threshold_down_test,
         sigma_floor=mapper_cfg.sigma_floor(horizon_days),
+        quantile_predictions=test_quantiles,
+        quantile_levels=quantile_levels,
+        mapping_mode=mapping_mode,
         eps=mapper_cfg.eps,
     )
     test_raw = np.column_stack([down_raw_test, flat_raw_test, up_raw_test])
+    test_raw = refine_raw_probabilities(
+        probs=test_raw,
+        horizon_days=horizon_days,
+        config=mapper_cfg,
+    )
     if calibrator is not None:
         test_model_cal = calibrator.predict_proba(
             np.log(np.clip(test_raw, mapper_cfg.eps, 1.0))
@@ -442,6 +514,15 @@ def _evaluate_one_horizon(
         max_shift=max_shift,
         eps=mapper_cfg.eps,
     )
+    test_guard, test_trigger_mask = _apply_short_guard_export(
+        raw_probs=test_raw,
+        calibrated_probs=test_cal,
+        mu=mu_test,
+        sigma=sigma_test,
+        horizon_days=horizon_days,
+        mapper_cfg=mapper_cfg,
+        eps=mapper_cfg.eps,
+    )
     regime_test = _assign_regimes_from_cutoffs(
         vol_values=vol_test,
         cutoffs=vol_cutoffs,
@@ -458,20 +539,76 @@ def _evaluate_one_horizon(
     else:
         test_final = calibrate_and_constrain(
             raw_probs=test_raw,
-            calibrated_probs=test_cal,
+            calibrated_probs=test_guard,
             base_probs=base_probs,
             mu=mu_test,
             sigma=sigma_test,
             lambda_h=lambda_h,
+            horizon_days=horizon_days,
+            regime_shift_score=0.0,
             regimes=regime_test,
             config=mapper_cfg,
         )
 
-    metrics_valid = _stage_metrics(valid_raw, valid_cal, valid_final, y_cls_dev[oof_mask], regime_valid)
-    metrics_test = _stage_metrics(test_raw, test_cal, test_final, y_cls_test, regime_test)
+    metrics_valid = _stage_metrics(valid_raw, valid_guard, valid_final, y_cls_dev[oof_mask], regime_valid)
+    metrics_test = _stage_metrics(test_raw, test_guard, test_final, y_cls_test, regime_test)
     train_dist = _distribution(y_cls_dev[train_core_mask])
     valid_dist = _distribution(y_cls_dev[oof_mask])
     test_dist = _distribution(y_cls_test)
+    recent_window_rows = min(mapper_cfg.base_prob_recent_window(horizon_days), y_cls_dev.shape[0])
+    recent_dist = _distribution(y_cls_dev[-recent_window_rows:])
+    train_by_regime = _distribution_by_regime_export(
+        labels=y_cls_dev,
+        regimes=regime_dev,
+        mask=train_core_mask,
+    )
+    valid_by_regime = _distribution_by_regime_export(
+        labels=y_cls_dev,
+        regimes=regime_dev,
+        mask=oof_mask,
+    )
+    test_by_regime = _distribution_by_regime_export(
+        labels=y_cls_test,
+        regimes=regime_test,
+        mask=np.ones(y_cls_test.shape[0], dtype=bool),
+    )
+    threshold_uncertain_bins = _threshold_uncertain_relation_export(
+        labels=y_cls_dev,
+        threshold_abs=np.abs(threshold_up_dev),
+        mask=np.isfinite(threshold_up_dev),
+        bins=5,
+    )
+    calibration_flip_summary = _calibration_flip_summary_export(
+        raw_probs=valid_raw,
+        calibrated_probs=valid_guard,
+        labels=y_cls_dev[oof_mask],
+        eps=mapper_cfg.eps,
+    )
+    short_guard_valid_stats = _short_guard_metrics_export(
+        raw_probs=valid_raw,
+        guard_probs=valid_guard,
+        labels=y_cls_dev[oof_mask],
+        trigger_mask=valid_trigger_mask,
+        eps=mapper_cfg.eps,
+    )
+    short_guard_test_stats = _short_guard_metrics_export(
+        raw_probs=test_raw,
+        guard_probs=test_guard,
+        labels=y_cls_test,
+        trigger_mask=test_trigger_mask,
+        eps=mapper_cfg.eps,
+    )
+    short_guard_stats = {
+        "enabled": bool(mapper_cfg.short_guard_enabled and horizon_days <= 5),
+        "alpha": float(mapper_cfg.short_guard_alpha if horizon_days <= 5 else 0.0),
+        "margin_threshold": float(mapper_cfg.short_guard_margin if horizon_days <= 5 else 0.0),
+        "uncertain_max": float(mapper_cfg.short_guard_uncertain_max if horizon_days <= 5 else 0.0),
+        "mu_sigma_min": float(mapper_cfg.short_guard_mu_sigma_min if horizon_days <= 5 else 0.0),
+        "trigger_scope": "test",
+        **short_guard_test_stats,
+        "valid": short_guard_valid_stats,
+        "test": short_guard_test_stats,
+    }
     regime_shift_score = (
         abs(train_dist["up"] - valid_dist["up"])
         + abs(train_dist["down"] - valid_dist["down"])
@@ -480,17 +617,18 @@ def _evaluate_one_horizon(
     valid_rows = _build_rows(
         dates=[feature_matrix.dates[idx] for idx in dev_global[oof_mask]],
         horizon=horizon,
+        horizon_days=horizon_days,
         split_name="valid",
         actual=y_cls_dev[oof_mask],
         raw_probs=valid_raw,
-        cal_probs=valid_cal,
+        cal_probs=valid_guard,
         final_probs=valid_final,
         regimes=regime_valid,
         mapper_cfg=mapper_cfg,
         regime_shift_score=regime_shift_score,
-        q10=oof_q10[oof_mask],
-        q50=oof_q50[oof_mask],
-        q90=oof_q90[oof_mask],
+        q10=oof_quantiles[q10_level][oof_mask],
+        q50=oof_quantiles[q50_level][oof_mask],
+        q90=oof_quantiles[q90_level][oof_mask],
         sigma=oof_sigma[oof_mask],
         sigma_floor=mapper_cfg.sigma_floor(horizon_days),
         threshold_low=threshold_down_dev[oof_mask],
@@ -499,10 +637,11 @@ def _evaluate_one_horizon(
     test_rows = _build_rows(
         dates=[feature_matrix.dates[idx] for idx in test_global],
         horizon=horizon,
+        horizon_days=horizon_days,
         split_name="test",
         actual=y_cls_test,
         raw_probs=test_raw,
-        cal_probs=test_cal,
+        cal_probs=test_guard,
         final_probs=test_final,
         regimes=regime_test,
         mapper_cfg=mapper_cfg,
@@ -517,7 +656,7 @@ def _evaluate_one_horizon(
     )
     recent = test_rows[-recent_rows:]
 
-    qgap_valid = oof_q90[oof_mask] - oof_q10[oof_mask]
+    qgap_valid = oof_quantiles[q90_level][oof_mask] - oof_quantiles[q10_level][oof_mask]
     qgap_test = q90_test - q10_test
     sigma_floor_value = mapper_cfg.sigma_floor(horizon_days)
     sigma_floor_hits_valid = int(np.sum(oof_sigma[oof_mask] <= sigma_floor_value + 1e-12))
@@ -531,22 +670,48 @@ def _evaluate_one_horizon(
             "valid": valid_dist,
             "test": test_dist,
         },
+        "recent_label_distribution": {
+            "window_rows": recent_window_rows,
+            "distribution": recent_dist,
+        },
+        "label_distribution_by_regime": {
+            "train": train_by_regime,
+            "valid": valid_by_regime,
+            "test": test_by_regime,
+        },
+        "threshold_uncertain_bins": threshold_uncertain_bins,
+        "calibration_flip_summary": calibration_flip_summary,
+        "short_guard_stats": short_guard_stats,
         "metrics_valid": metrics_valid,
         "metrics_test": metrics_test,
         "chain_overall_test": {
             "avg_raw_probs": _prob_dict(np.mean(test_raw, axis=0)),
-            "avg_calibrated_probs": _prob_dict(np.mean(test_cal, axis=0)),
+            "avg_calibrated_probs": _prob_dict(np.mean(test_guard, axis=0)),
             "avg_final_probs": _prob_dict(np.mean(test_final, axis=0)),
             "avg_signal_strength": float(np.mean([float(item["signal_strength"]) for item in test_rows])),
+            "avg_regime_shift_boost_delta": float(
+                np.mean([float(item["regime_shift_boost_delta"]) for item in test_rows])
+            ),
+            "avg_high_vol_boost_delta": float(
+                np.mean([float(item["high_vol_boost_delta"]) for item in test_rows])
+            ),
+            "avg_total_uncertain_boost_delta": float(
+                np.mean([float(item["total_uncertain_boost_delta"]) for item in test_rows])
+            ),
+            "avg_raw_uncertain": float(np.mean([float(item["raw_uncertain"]) for item in test_rows])),
+            "avg_final_uncertain": float(np.mean([float(item["final_uncertain"]) for item in test_rows])),
+            "uncertain_ceiling_applied_ratio": float(
+                np.mean([1.0 if bool(item["uncertain_ceiling_applied"]) else 0.0 for item in test_rows])
+            ),
             "predicted_class_count_final": _display_class_count(test_rows, "predicted_class_final"),
         },
         "recent_test_rows": recent,
         "sample_rows": valid_rows + test_rows,
         "distribution_params": {
             "valid": {
-                "q10": _summary_stats(oof_q10[oof_mask]),
-                "q50": _summary_stats(oof_q50[oof_mask]),
-                "q90": _summary_stats(oof_q90[oof_mask]),
+                "q10": _summary_stats(oof_quantiles[q10_level][oof_mask]),
+                "q50": _summary_stats(oof_quantiles[q50_level][oof_mask]),
+                "q90": _summary_stats(oof_quantiles[q90_level][oof_mask]),
                 "implied_sigma": _summary_stats(oof_sigma[oof_mask]),
                 "threshold_low": _summary_stats(threshold_down_dev[oof_mask]),
                 "threshold_high": _summary_stats(threshold_up_dev[oof_mask]),
@@ -588,6 +753,7 @@ def _build_rows(
     *,
     dates: list[Any],
     horizon: str,
+    horizon_days: int,
     split_name: str,
     actual: np.ndarray,
     raw_probs: np.ndarray,
@@ -613,6 +779,7 @@ def _build_rows(
             raw_probs=raw,
             cal_probs=cal,
             final_probs=fin,
+            horizon_days=horizon_days,
             regime=str(regimes[idx]),
             mapper_cfg=mapper_cfg,
             regime_shift_score=regime_shift_score,
@@ -630,9 +797,21 @@ def _build_rows(
                 "cal_up": float(display["cal_up"]),
                 "cal_down": float(display["cal_down"]),
                 "cal_uncertain": float(display["cal_uncertain"]),
+                "post_shrink_up": float(display["post_shrink_up"]),
+                "post_shrink_down": float(display["post_shrink_down"]),
+                "post_shrink_uncertain": float(display["post_shrink_uncertain"]),
+                "post_uncertainty_boost_up": float(display["post_uncertainty_boost_up"]),
+                "post_uncertainty_boost_down": float(display["post_uncertainty_boost_down"]),
+                "post_uncertainty_boost_uncertain": float(
+                    display["post_uncertainty_boost_uncertain"]
+                ),
                 "final_up": float(display["final_up"]),
                 "final_down": float(display["final_down"]),
                 "final_uncertain": float(display["final_uncertain"]),
+                "regime_shift_boost_delta": float(display["regime_shift_boost_delta"]),
+                "high_vol_boost_delta": float(display["high_vol_boost_delta"]),
+                "total_uncertain_boost_delta": float(display["total_uncertain_boost_delta"]),
+                "uncertain_ceiling_applied": bool(display["uncertain_ceiling_applied"]),
                 "q10": float(q10[idx]),
                 "q50": float(q50[idx]),
                 "q90": float(q90[idx]),
@@ -667,6 +846,7 @@ def _derive_display_payload(
     raw_probs: np.ndarray,
     cal_probs: np.ndarray,
     final_probs: np.ndarray,
+    horizon_days: int,
     regime: str,
     mapper_cfg: ProbabilityMapperConfig,
     regime_shift_score: float,
@@ -674,6 +854,155 @@ def _derive_display_payload(
     raw_up, raw_down, raw_uncertain = _to_display_probs(raw_probs)
     cal_up, cal_down, cal_uncertain = _to_display_probs(cal_probs)
     final_up, final_down, final_uncertain = _to_display_probs(final_probs)
+
+    stage_raw_up = raw_up
+    stage_raw_down = raw_down
+    stage_raw_uncertain = raw_uncertain
+    stage_cal_up = cal_up
+    stage_cal_down = cal_down
+    stage_cal_uncertain = cal_uncertain
+
+    warning_codes: list[str] = []
+    final_direction_mass = max(final_up + final_down, mapper_cfg.eps)
+    final_up_cond = float(np.clip(final_up / final_direction_mass, 0.0, 1.0))
+    cap = float(np.clip(mapper_cfg.display_prob_cap, 0.50, 0.99))
+    if final_up_cond >= cap + 1e-12:
+        final_up_cond = cap
+        warning_codes.append("direction_cap_up")
+    elif final_up_cond <= (1.0 - cap) - 1e-12:
+        final_up_cond = 1.0 - cap
+        warning_codes.append("direction_cap_down")
+
+    final_direction_mass = max(1.0 - final_uncertain, mapper_cfg.eps)
+    final_up = final_direction_mass * final_up_cond
+    final_down = final_direction_mass * (1.0 - final_up_cond)
+    final_up, final_down, final_uncertain = _normalize_up_down_uncertain_export(
+        up=final_up,
+        down=final_down,
+        uncertain=final_uncertain,
+        eps=mapper_cfg.eps,
+    )
+
+    pre_guard = np.asarray([final_up, final_down, final_uncertain], dtype=float)
+    pre_guard_top_idx = int(np.argmax(pre_guard))
+    pre_guard_sorted = np.sort(pre_guard)
+    pre_guard_margin = float(max(pre_guard_sorted[-1] - pre_guard_sorted[-2], 0.0))
+
+    raw_boost_multiplier = _raw_uncertainty_boost_multiplier_export(
+        raw_uncertain=stage_raw_uncertain,
+        soft_threshold=mapper_cfg.display_raw_uncertain_soft_threshold,
+        hard_threshold=mapper_cfg.display_raw_uncertain_hard_threshold,
+    )
+    step_cap = mapper_cfg.display_uncertain_step_cap(horizon_days)
+    total_boost_cap = min(mapper_cfg.display_max_total_uncertain_boost(horizon_days), step_cap * 2.0)
+    boost_remaining = max(total_boost_cap, 0.0)
+    regime_shift_boost_delta = 0.0
+    high_vol_boost_delta = 0.0
+
+    post_shrink_up = final_up
+    post_shrink_down = final_down
+    post_shrink_uncertain = final_uncertain
+    post_uncertainty_boost_up = final_up
+    post_uncertainty_boost_down = final_down
+    post_uncertainty_boost_uncertain = final_uncertain
+
+    allow_uncertain_boost = (
+        pre_guard_top_idx != 2
+        and pre_guard_margin < mapper_cfg.display_guardrail_margin_freeze
+    )
+
+    if allow_uncertain_boost and regime_shift_score >= mapper_cfg.display_regime_shift_threshold:
+        final_direction_mass = max(final_up + final_down, mapper_cfg.eps)
+        final_up_cond = float(np.clip(final_up / final_direction_mass, 0.0, 1.0))
+        shrink = min(0.18, 0.06 + 0.30 * (regime_shift_score - mapper_cfg.display_regime_shift_threshold))
+        shrink = max(0.0, shrink)
+        final_up_cond = 0.5 + (final_up_cond - 0.5) * (1.0 - shrink)
+        desired_boost = mapper_cfg.display_regime_shift_uncertain_boost(horizon_days) * 0.25 * raw_boost_multiplier
+        actual_boost = min(
+            desired_boost,
+            step_cap,
+            boost_remaining,
+            max(0.0, 0.95 - final_uncertain),
+        )
+        if actual_boost > mapper_cfg.eps:
+            final_uncertain += actual_boost
+            boost_remaining = max(0.0, boost_remaining - actual_boost)
+            warning_codes.append("regime_shift_shrink")
+            regime_shift_boost_delta = float(actual_boost)
+        final_direction_mass = max(1.0 - final_uncertain, mapper_cfg.eps)
+        final_up = final_direction_mass * final_up_cond
+        final_down = final_direction_mass * (1.0 - final_up_cond)
+        final_up, final_down, final_uncertain = _normalize_up_down_uncertain_export(
+            up=final_up,
+            down=final_down,
+            uncertain=final_uncertain,
+            eps=mapper_cfg.eps,
+        )
+        post_shrink_up = final_up
+        post_shrink_down = final_down
+        post_shrink_uncertain = final_uncertain
+
+    if allow_uncertain_boost and regime in {"high_vol", "high_vol_extreme"}:
+        final_direction_mass = max(final_up + final_down, mapper_cfg.eps)
+        final_up_cond = float(np.clip(final_up / final_direction_mass, 0.0, 1.0))
+        if abs(final_up_cond - 0.5) < 0.14:
+            desired_boost = mapper_cfg.display_high_vol_uncertain_boost(horizon_days) * 0.25 * raw_boost_multiplier
+            actual_boost = min(
+                desired_boost,
+                step_cap,
+                boost_remaining,
+                max(0.0, 0.95 - final_uncertain),
+            )
+            if actual_boost > mapper_cfg.eps:
+                final_uncertain += actual_boost
+                boost_remaining = max(0.0, boost_remaining - actual_boost)
+                warning_codes.append("high_vol_uncertain_boost")
+                high_vol_boost_delta = float(actual_boost)
+            final_direction_mass = max(1.0 - final_uncertain, mapper_cfg.eps)
+            final_up = final_direction_mass * final_up_cond
+            final_down = final_direction_mass * (1.0 - final_up_cond)
+            final_up, final_down, final_uncertain = _normalize_up_down_uncertain_export(
+                up=final_up,
+                down=final_down,
+                uncertain=final_uncertain,
+                eps=mapper_cfg.eps,
+            )
+            post_uncertainty_boost_up = final_up
+            post_uncertainty_boost_down = final_down
+            post_uncertainty_boost_uncertain = final_uncertain
+
+    uncertain_ceiling_applied = False
+    uncertain_ceiling = mapper_cfg.display_uncertain_ceiling(horizon_days)
+    if final_uncertain > uncertain_ceiling + 1e-12:
+        overflow = final_uncertain - uncertain_ceiling
+        final_uncertain = uncertain_ceiling
+        direction_after = max(final_up + final_down, mapper_cfg.eps)
+        final_up += overflow * (final_up / direction_after)
+        final_down += overflow * (final_down / direction_after)
+        uncertain_ceiling_applied = True
+        warning_codes.append("uncertain_ceiling_applied")
+
+    final_up, final_down, final_uncertain = _normalize_up_down_uncertain_export(
+        up=final_up,
+        down=final_down,
+        uncertain=final_uncertain,
+        eps=mapper_cfg.eps,
+    )
+
+    if (
+        (not mapper_cfg.display_allow_top1_reorder)
+        and pre_guard_top_idx in {0, 1}
+        and int(np.argmax(np.asarray([final_up, final_down, final_uncertain], dtype=float))) != pre_guard_top_idx
+    ):
+        final_up = float(pre_guard[0])
+        final_down = float(pre_guard[1])
+        final_uncertain = float(pre_guard[2])
+        post_uncertainty_boost_up = final_up
+        post_uncertainty_boost_down = final_down
+        post_uncertainty_boost_uncertain = final_uncertain
+        regime_shift_boost_delta = 0.0
+        high_vol_boost_delta = 0.0
+        warning_codes.append("display_top1_guard_revert")
 
     final_mass = max(final_up + final_down, mapper_cfg.eps)
     final_up_cond = final_up / final_mass
@@ -694,17 +1023,6 @@ def _derive_display_payload(
         elif final_up_cond <= (1.0 - mapper_cfg.display_high_conf_threshold):
             internal_state = "high-confidence down"
 
-    warning_codes: list[str] = []
-    cap = float(np.clip(mapper_cfg.display_prob_cap, 0.50, 0.99))
-    if final_up_cond >= cap - 1e-6:
-        warning_codes.append("direction_cap_up")
-    elif final_up_cond <= (1.0 - cap) + 1e-6:
-        warning_codes.append("direction_cap_down")
-    if regime_shift_score >= mapper_cfg.display_regime_shift_threshold and max(final_up_cond, 1.0 - final_up_cond) >= 0.70:
-        warning_codes.append("regime_shift_shrink")
-    if regime in {"high_vol", "high_vol_extreme"} and abs(final_up_cond - 0.5) < 0.18:
-        warning_codes.append("high_vol_uncertain_boost")
-
     warning_code = ";".join(dict.fromkeys(warning_codes))
     display_label = _resolve_display_label_export(
         internal_state=internal_state,
@@ -722,15 +1040,25 @@ def _derive_display_payload(
         prob_down=final_down,
     )
     return {
-        "raw_up": raw_up,
-        "raw_down": raw_down,
-        "raw_uncertain": raw_uncertain,
-        "cal_up": cal_up,
-        "cal_down": cal_down,
-        "cal_uncertain": cal_uncertain,
+        "raw_up": stage_raw_up,
+        "raw_down": stage_raw_down,
+        "raw_uncertain": stage_raw_uncertain,
+        "cal_up": stage_cal_up,
+        "cal_down": stage_cal_down,
+        "cal_uncertain": stage_cal_uncertain,
+        "post_shrink_up": post_shrink_up,
+        "post_shrink_down": post_shrink_down,
+        "post_shrink_uncertain": post_shrink_uncertain,
+        "post_uncertainty_boost_up": post_uncertainty_boost_up,
+        "post_uncertainty_boost_down": post_uncertainty_boost_down,
+        "post_uncertainty_boost_uncertain": post_uncertainty_boost_uncertain,
         "final_up": final_up,
         "final_down": final_down,
         "final_uncertain": final_uncertain,
+        "regime_shift_boost_delta": regime_shift_boost_delta,
+        "high_vol_boost_delta": high_vol_boost_delta,
+        "total_uncertain_boost_delta": float(max(0.0, final_uncertain - stage_raw_uncertain)),
+        "uncertain_ceiling_applied": bool(uncertain_ceiling_applied),
         "internal_state": internal_state,
         "label": label,
         "headline_label": DISPLAY_HEADLINE_MAP.get(display_label, "不确定"),
@@ -742,8 +1070,8 @@ def _derive_display_payload(
         "warning_level": _warning_level_from_codes(warning_code),
         "warning_code": warning_code,
         "warning_message": _warning_message_from_codes(warning_code),
-        "predicted_class_raw": _predicted_class(raw_up, raw_down, raw_uncertain),
-        "predicted_class_cal": _predicted_class(cal_up, cal_down, cal_uncertain),
+        "predicted_class_raw": _predicted_class(stage_raw_up, stage_raw_down, stage_raw_uncertain),
+        "predicted_class_cal": _predicted_class(stage_cal_up, stage_cal_down, stage_cal_uncertain),
         "predicted_class_final": _predicted_class(final_up, final_down, final_uncertain),
     }
 
@@ -758,12 +1086,53 @@ def _to_display_probs(values: np.ndarray) -> tuple[float, float, float]:
     return (up / total, down / total, uncertain / total)
 
 
+def _normalize_up_down_uncertain_export(
+    *,
+    up: float,
+    down: float,
+    uncertain: float,
+    eps: float,
+) -> tuple[float, float, float]:
+    up_v = float(np.clip(up, 0.0, 1.0))
+    down_v = float(np.clip(down, 0.0, 1.0))
+    uncertain_v = float(np.clip(uncertain, 0.0, 1.0))
+    total = up_v + down_v + uncertain_v
+    if total <= eps:
+        return (1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0)
+    return (up_v / total, down_v / total, uncertain_v / total)
+
+
+def _raw_uncertainty_boost_multiplier_export(
+    *,
+    raw_uncertain: float,
+    soft_threshold: float,
+    hard_threshold: float,
+) -> float:
+    raw = float(np.clip(raw_uncertain, 0.0, 1.0))
+    soft = float(np.clip(soft_threshold, 0.0, 1.0))
+    hard = float(np.clip(hard_threshold, soft + 1e-6, 1.0))
+    if raw <= soft:
+        return 1.0
+    if raw >= hard:
+        return 0.0
+    span = max(hard - soft, 1e-6)
+    return float(np.clip((hard - raw) / span, 0.0, 1.0))
+
+
 def _predicted_class(prob_up: float, prob_down: float, prob_uncertain: float) -> str:
     if prob_up >= prob_down and prob_up >= prob_uncertain:
         return "up"
     if prob_down >= prob_up and prob_down >= prob_uncertain:
         return "down"
     return "uncertain"
+
+
+def _nearest_quantile_level_export(levels: Sequence[float], target: float) -> float:
+    arr = np.asarray(list(levels), dtype=float)
+    if arr.shape[0] == 0:
+        raise ValueError("quantile levels 不能为空")
+    idx = int(np.argmin(np.abs(arr - float(target))))
+    return float(arr[idx])
 
 
 def _resolve_direction_label_export(*, internal_state: str, prob_up: float, prob_down: float) -> str:
@@ -791,6 +1160,15 @@ def _resolve_display_label_export(
     mapper_cfg: ProbabilityMapperConfig,
 ) -> str:
     if internal_state == "uncertain":
+        uncertain_prob = float(np.clip(1.0 - prob_up - prob_down, 0.0, 1.0))
+        direction_up = prob_up >= prob_down
+        direction_gap = abs(prob_up - prob_down)
+        if (
+            uncertain_prob <= mapper_cfg.display_label_uncertain_lean_max_uncertain
+            and direction_gap >= mapper_cfg.display_label_uncertain_lean_gap
+            and signal_strength >= mapper_cfg.display_label_uncertain_confidence
+        ):
+            return "mild_up" if direction_up else "mild_down"
         return "uncertain"
     if signal_strength < mapper_cfg.display_label_uncertain_confidence:
         return "uncertain"
@@ -813,7 +1191,15 @@ def _warning_level_from_codes(codes: str) -> str:
     tokens = [token.strip() for token in codes.split(";") if token.strip()]
     if not tokens:
         return "none"
-    if any(token in {"direction_cap_up", "direction_cap_down", "cross_horizon_conflict_shrink"} for token in tokens):
+    if any(
+        token in {
+            "direction_cap_up",
+            "direction_cap_down",
+            "cross_horizon_conflict_shrink",
+            "display_top1_guard_revert",
+        }
+        for token in tokens
+    ):
         return "warning"
     return "info"
 
@@ -839,6 +1225,88 @@ def _stage_metrics(
         evaluate_probabilities(probs=final_probs, labels=labels, regimes=regimes, bins=10)
     )
     return {"raw": raw, "calibrated": cal, "final": final}
+
+
+def _empty_short_guard_stats_export() -> dict[str, Any]:
+    return {
+        "trigger_rate": 0.0,
+        "trigger_count": 0,
+        "triggered_flip_rate": 0.0,
+        "triggered_raw_top1_acc": 0.0,
+        "triggered_guard_top1_acc": 0.0,
+        "triggered_logloss": 0.0,
+        "triggered_brier": 0.0,
+        "triggered_to_uncertain_rate": 0.0,
+    }
+
+
+def _short_guard_metrics_export(
+    *,
+    raw_probs: np.ndarray,
+    guard_probs: np.ndarray,
+    labels: np.ndarray,
+    trigger_mask: np.ndarray,
+    eps: float,
+) -> dict[str, Any]:
+    base = _empty_short_guard_stats_export()
+    if trigger_mask.shape[0] == 0:
+        return base
+    trigger = trigger_mask.astype(bool)
+    trigger_count = int(np.sum(trigger))
+    base["trigger_rate"] = float(np.mean(trigger))
+    base["trigger_count"] = trigger_count
+    if trigger_count <= 0:
+        return base
+
+    y = labels.astype(int)
+    raw_major = np.argmax(raw_probs, axis=1)
+    guard_major = np.argmax(guard_probs, axis=1)
+    flip = raw_major != guard_major
+
+    idx = np.arange(trigger_count, dtype=int)
+    y_trigger = y[trigger]
+    raw_trigger = np.clip(raw_probs[trigger], eps, 1.0)
+    guard_trigger = np.clip(guard_probs[trigger], eps, 1.0)
+    onehot = np.eye(3)[y_trigger]
+
+    base["triggered_flip_rate"] = float(np.mean(flip[trigger]))
+    base["triggered_raw_top1_acc"] = float(np.mean(raw_major[trigger] == y_trigger))
+    base["triggered_guard_top1_acc"] = float(np.mean(guard_major[trigger] == y_trigger))
+    base["triggered_logloss"] = float(np.mean(-np.log(guard_trigger[idx, y_trigger])))
+    base["triggered_brier"] = float(np.mean(np.sum((guard_trigger - onehot) ** 2, axis=1)))
+    base["triggered_to_uncertain_rate"] = float(np.mean(guard_major[trigger] == LABEL_FLAT))
+    return base
+
+
+def _apply_short_guard_export(
+    *,
+    raw_probs: np.ndarray,
+    calibrated_probs: np.ndarray,
+    mu: np.ndarray,
+    sigma: np.ndarray,
+    horizon_days: int,
+    mapper_cfg: ProbabilityMapperConfig,
+    eps: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    if (not mapper_cfg.short_guard_enabled) or horizon_days > 5:
+        return calibrated_probs, np.zeros(raw_probs.shape[0], dtype=bool)
+    raw = np.clip(raw_probs, eps, 1.0)
+    cal = np.clip(calibrated_probs, eps, 1.0)
+    margin = np.abs(raw[:, LABEL_UP] - raw[:, LABEL_DOWN])
+    raw_uncertain = raw[:, LABEL_FLAT]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mu_sigma = np.abs(mu / np.maximum(sigma, eps)).astype(float)
+    trigger = (
+        (margin > mapper_cfg.short_guard_margin)
+        & (raw_uncertain < mapper_cfg.short_guard_uncertain_max)
+        & (mu_sigma > mapper_cfg.short_guard_mu_sigma_min)
+    )
+    if not np.any(trigger):
+        return cal, trigger
+    alpha = float(np.clip(mapper_cfg.short_guard_alpha, 0.0, 1.0))
+    guarded = cal.copy()
+    guarded[trigger] = alpha * cal[trigger] + (1.0 - alpha) * raw[trigger]
+    return guarded, trigger
 
 
 def _build_long_focus(detail: dict[str, Any], mapper_cfg: ProbabilityMapperConfig) -> dict[str, Any]:
@@ -1020,6 +1488,315 @@ def _to_summary_row(horizon: str, detail: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _build_short_guard_v2_exports(
+    *,
+    short_detail: dict[str, Any],
+    feature_matrix: Any,
+    symbol: str,
+    min_count: int,
+    acc_thresh: float,
+    logloss_thresh: float,
+    flip_thresh: float,
+) -> dict[str, Any]:
+    short_rows = list(short_detail.get("sample_rows", []))
+    if not short_rows:
+        return {"sample_rows": [], "bucket_rows": [], "candidate_rows": [], "config": {}}
+
+    date_to_index = {item.isoformat(): idx for idx, item in enumerate(feature_matrix.dates)}
+    feature_name_to_idx = {name: idx for idx, name in enumerate(feature_matrix.feature_names)}
+    ma_spread_idx = feature_name_to_idx.get("ma_spread_5_20")
+    drawdown_idx = feature_name_to_idx.get("drawdown_20")
+    if ma_spread_idx is None or drawdown_idx is None:
+        raise RuntimeError("feature matrix 缺少 short v2 分桶所需字段: ma_spread_5_20/drawdown_20")
+
+    spreads: list[float] = []
+    drawdowns: list[float] = []
+    for row in short_rows:
+        idx = date_to_index.get(str(row["date"]))
+        if idx is None:
+            continue
+        spread_v = float(feature_matrix.values[idx, ma_spread_idx])
+        drawdown_v = float(feature_matrix.values[idx, drawdown_idx])
+        if np.isfinite(spread_v):
+            spreads.append(abs(spread_v))
+        if np.isfinite(drawdown_v):
+            drawdowns.append(drawdown_v)
+    spread_q33 = float(np.quantile(np.asarray(spreads, dtype=float), 0.33)) if spreads else 0.003
+    spread_q66 = float(np.quantile(np.asarray(spreads, dtype=float), 0.66)) if spreads else 0.008
+    dd_q33 = float(np.quantile(np.asarray(drawdowns, dtype=float), 0.33)) if drawdowns else -0.03
+    dd_q66 = float(np.quantile(np.asarray(drawdowns, dtype=float), 0.66)) if drawdowns else -0.01
+
+    sample_rows: list[dict[str, Any]] = []
+    for row in short_rows:
+        sample = _to_short_v2_sample_row(
+            row=row,
+            symbol=symbol,
+            date_to_index=date_to_index,
+            feature_matrix=feature_matrix,
+            ma_spread_idx=ma_spread_idx,
+            drawdown_idx=drawdown_idx,
+            spread_q33=spread_q33,
+            spread_q66=spread_q66,
+            dd_q33=dd_q33,
+            dd_q66=dd_q66,
+        )
+        sample_rows.append(sample)
+
+    bucket_rows = _build_short_v2_bucket_rows(sample_rows)
+    candidate_rows = _build_short_v2_candidate_rows(
+        bucket_rows=bucket_rows,
+        min_count=min_count,
+        acc_thresh=acc_thresh,
+        logloss_thresh=logloss_thresh,
+        flip_thresh=flip_thresh,
+    )
+    return {
+        "sample_rows": sample_rows,
+        "bucket_rows": bucket_rows,
+        "candidate_rows": candidate_rows,
+        "config": {
+            "min_count": int(min_count),
+            "acc_thresh": float(acc_thresh),
+            "logloss_thresh": float(logloss_thresh),
+            "flip_thresh": float(flip_thresh),
+            "trend_abs_q33": spread_q33,
+            "trend_abs_q66": spread_q66,
+            "drawdown_q33": dd_q33,
+            "drawdown_q66": dd_q66,
+        },
+    }
+
+
+def _to_short_v2_sample_row(
+    *,
+    row: dict[str, Any],
+    symbol: str,
+    date_to_index: dict[str, int],
+    feature_matrix: Any,
+    ma_spread_idx: int,
+    drawdown_idx: int,
+    spread_q33: float,
+    spread_q66: float,
+    dd_q33: float,
+    dd_q66: float,
+) -> dict[str, Any]:
+    actual_label = str(row["actual_label"]).strip().lower()
+    actual_idx = {"down": 0, "flat": 1, "up": 2}.get(actual_label, 1)
+    raw_probs = np.asarray([float(row["raw_down"]), float(row["raw_uncertain"]), float(row["raw_up"])], dtype=float)
+    cal_probs = np.asarray([float(row["cal_down"]), float(row["cal_uncertain"]), float(row["cal_up"])], dtype=float)
+    raw_probs = raw_probs / max(float(np.sum(raw_probs)), 1e-12)
+    cal_probs = cal_probs / max(float(np.sum(cal_probs)), 1e-12)
+    raw_top_idx = int(np.argmax(raw_probs))
+    cal_top_idx = int(np.argmax(cal_probs))
+    raw_top1 = LABEL_TO_NAME.get(raw_top_idx, "flat")
+    cal_top1 = LABEL_TO_NAME.get(cal_top_idx, "flat")
+    raw_top1_prob = float(raw_probs[raw_top_idx])
+    cal_top1_prob = float(cal_probs[cal_top_idx])
+    raw_margin = float(max(np.sort(raw_probs)[-1] - np.sort(raw_probs)[-2], 0.0))
+    cal_margin = float(max(np.sort(cal_probs)[-1] - np.sort(cal_probs)[-2], 0.0))
+    raw_correct = int(raw_top_idx == actual_idx)
+    cal_correct = int(cal_top_idx == actual_idx)
+    flipped = int(raw_top_idx != cal_top_idx)
+    flip_improved = int((raw_correct == 0) and (cal_correct == 1))
+
+    raw_logloss = float(-np.log(np.clip(raw_probs[actual_idx], 1e-12, 1.0)))
+    cal_logloss = float(-np.log(np.clip(cal_probs[actual_idx], 1e-12, 1.0)))
+    one_hot = np.zeros(3, dtype=float)
+    one_hot[actual_idx] = 1.0
+    raw_brier = float(np.sum((raw_probs - one_hot) ** 2))
+    cal_brier = float(np.sum((cal_probs - one_hot) ** 2))
+
+    mu = float(row["q50"])
+    sigma = float(row["sigma"])
+    mu_sigma_abs = float(abs(mu) / max(abs(sigma), 1e-12))
+
+    idx = date_to_index.get(str(row["date"]))
+    ma_spread = float(feature_matrix.values[idx, ma_spread_idx]) if idx is not None else float("nan")
+    drawdown = float(feature_matrix.values[idx, drawdown_idx]) if idx is not None else float("nan")
+
+    trend_bucket = _trend_bucket(ma_spread, spread_q33, spread_q66)
+    drawdown_bucket = _drawdown_bucket(drawdown, dd_q33, dd_q66)
+    vol_bucket = _normalize_vol_bucket(str(row.get("regime", "unknown")))
+
+    return {
+        "date": str(row["date"]),
+        "symbol": symbol,
+        "split": str(row["split"]),
+        "actual_label": actual_label,
+        "raw_up": float(row["raw_up"]),
+        "raw_down": float(row["raw_down"]),
+        "raw_uncertain": float(row["raw_uncertain"]),
+        "cal_up": float(row["cal_up"]),
+        "cal_down": float(row["cal_down"]),
+        "cal_uncertain": float(row["cal_uncertain"]),
+        "raw_top1": raw_top1,
+        "cal_top1": cal_top1,
+        "raw_top1_prob": raw_top1_prob,
+        "cal_top1_prob": cal_top1_prob,
+        "raw_margin": raw_margin,
+        "cal_margin": cal_margin,
+        "mu": mu,
+        "sigma": sigma,
+        "mu_sigma_abs": mu_sigma_abs,
+        "regime": str(row.get("regime", "unknown")),
+        "vol_bucket": vol_bucket,
+        "trend_bucket": trend_bucket,
+        "drawdown_bucket": drawdown_bucket,
+        "regime_combo": f"{vol_bucket}|{trend_bucket}",
+        "regime_combo_drawdown": f"{vol_bucket}|{drawdown_bucket}",
+        "raw_correct": raw_correct,
+        "cal_correct": cal_correct,
+        "flipped": flipped,
+        "flip_improved": flip_improved,
+        "raw_logloss": raw_logloss,
+        "cal_logloss": cal_logloss,
+        "raw_brier": raw_brier,
+        "cal_brier": cal_brier,
+    }
+
+
+def _normalize_vol_bucket(regime: str) -> str:
+    key = regime.strip().lower()
+    if key in {"low_vol", "mid_vol", "high_vol"}:
+        return key
+    if key == "high_vol_extreme":
+        return "high_vol"
+    return "unknown"
+
+
+def _trend_bucket(value: float, q33: float, q66: float) -> str:
+    if not np.isfinite(value):
+        return "unknown_trend"
+    abs_value = abs(float(value))
+    if abs_value <= q33:
+        return "weak_trend"
+    if abs_value >= q66:
+        return "strong_trend"
+    return "mid_trend"
+
+
+def _drawdown_bucket(value: float, q33: float, q66: float) -> str:
+    if not np.isfinite(value):
+        return "unknown_drawdown"
+    if value <= q33:
+        return "deep_drawdown"
+    if value <= q66:
+        return "mid_drawdown"
+    return "shallow_drawdown"
+
+
+def _fixed_bucket(value: float, edges: Sequence[float]) -> str:
+    if not np.isfinite(value):
+        return "nan"
+    low = 0.0
+    for edge in edges:
+        if value <= edge:
+            return f"{low:.2f}-{edge:.2f}"
+        low = edge
+    return f">{edges[-1]:.2f}"
+
+
+def _build_short_v2_bucket_rows(sample_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not sample_rows:
+        return []
+    total = float(len(sample_rows))
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for item in sample_rows:
+        keys = [
+            ("margin", _fixed_bucket(float(item["raw_margin"]), [0.05, 0.10, 0.15, 0.20])),
+            ("uncertain", _fixed_bucket(float(item["raw_uncertain"]), [0.15, 0.25, 0.35, 0.50])),
+            ("mu_sigma", _fixed_bucket(float(item["mu_sigma_abs"]), [0.5, 0.8, 1.2, 1.8])),
+            ("vol_bucket", str(item["vol_bucket"])),
+            ("trend_bucket", str(item["trend_bucket"])),
+            ("drawdown_bucket", str(item["drawdown_bucket"])),
+            ("regime_combo", str(item["regime_combo"])),
+            ("regime_combo_drawdown", str(item["regime_combo_drawdown"])),
+        ]
+        for key in keys:
+            groups.setdefault(key, []).append(item)
+
+    rows: list[dict[str, Any]] = []
+    for (bucket_type, bucket_name), items in sorted(groups.items(), key=lambda x: (x[0][0], x[0][1])):
+        count = len(items)
+        raw_top1_share = float(np.mean([1.0 if it["raw_top1"] in {"up", "down"} else 0.0 for it in items]))
+        cal_top1_share = float(np.mean([1.0 if it["cal_top1"] in {"up", "down"} else 0.0 for it in items]))
+        flipped = [float(it["flipped"]) for it in items]
+        flip_mask = [it for it in items if int(it["flipped"]) == 1]
+        rows.append(
+            {
+                "bucket_type": bucket_type,
+                "bucket_name": bucket_name,
+                "count": int(count),
+                "weight": float(count / total),
+                "raw_top1_acc": float(np.mean([it["raw_correct"] for it in items])),
+                "cal_top1_acc": float(np.mean([it["cal_correct"] for it in items])),
+                "acc_delta": float(
+                    np.mean([it["raw_correct"] for it in items]) - np.mean([it["cal_correct"] for it in items])
+                ),
+                "raw_logloss": float(np.mean([it["raw_logloss"] for it in items])),
+                "cal_logloss": float(np.mean([it["cal_logloss"] for it in items])),
+                "logloss_delta": float(
+                    np.mean([it["cal_logloss"] for it in items]) - np.mean([it["raw_logloss"] for it in items])
+                ),
+                "raw_brier": float(np.mean([it["raw_brier"] for it in items])),
+                "cal_brier": float(np.mean([it["cal_brier"] for it in items])),
+                "brier_delta": float(
+                    np.mean([it["cal_brier"] for it in items]) - np.mean([it["raw_brier"] for it in items])
+                ),
+                "flip_rate": float(np.mean(flipped)),
+                "flip_improve_rate": float(
+                    np.mean([it["flip_improved"] for it in flip_mask]) if flip_mask else 0.0
+                ),
+                "raw_top1_share": raw_top1_share,
+                "cal_top1_share": cal_top1_share,
+            }
+        )
+    return rows
+
+
+def _build_short_v2_candidate_rows(
+    *,
+    bucket_rows: list[dict[str, Any]],
+    min_count: int,
+    acc_thresh: float,
+    logloss_thresh: float,
+    flip_thresh: float,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in bucket_rows:
+        count_ok = int(row["count"]) >= int(min_count)
+        acc_ok = float(row["acc_delta"]) >= float(acc_thresh)
+        ll_ok = float(row["logloss_delta"]) >= float(logloss_thresh)
+        flip_ok = float(row["flip_rate"]) >= float(flip_thresh)
+        suggest_guard = int(count_ok and acc_ok and ll_ok and flip_ok)
+        rows.append(
+            {
+                **row,
+                "min_count": int(min_count),
+                "acc_thresh": float(acc_thresh),
+                "logloss_thresh": float(logloss_thresh),
+                "flip_thresh": float(flip_thresh),
+                "count_ok": int(count_ok),
+                "acc_ok": int(acc_ok),
+                "logloss_ok": int(ll_ok),
+                "flip_ok": int(flip_ok),
+                "suggest_guard": suggest_guard,
+                "suggest_alpha_range": "0.75~0.85" if suggest_guard else "",
+            }
+        )
+    rows.sort(
+        key=lambda item: (
+            int(item["suggest_guard"]),
+            float(item["acc_delta"]),
+            float(item["logloss_delta"]),
+            float(item["flip_rate"]),
+            int(item["count"]),
+        ),
+        reverse=True,
+    )
+    return rows
+
+
 def _choose_test_size(n_total: int, min_train: int, min_valid: int) -> int:
     target = max(min_valid, int(round(n_total * 0.18)))
     max_test = n_total - (min_train + min_valid)
@@ -1037,6 +1814,124 @@ def _distribution(labels: np.ndarray) -> dict[str, float]:
         "up": float(counts[LABEL_UP] / total),
         "flat": float(counts[LABEL_FLAT] / total),
         "down": float(counts[LABEL_DOWN] / total),
+    }
+
+
+def _distribution_by_regime_export(
+    *,
+    labels: np.ndarray,
+    regimes: np.ndarray,
+    mask: np.ndarray,
+) -> dict[str, dict[str, float]]:
+    out: dict[str, dict[str, float]] = {}
+    if labels.shape[0] == 0:
+        return out
+    valid = mask.astype(bool) & np.isfinite(labels)
+    if int(np.sum(valid)) == 0:
+        return out
+    regime_values = regimes[valid].astype(object)
+    label_values = labels[valid].astype(int)
+    unique_regimes = sorted({str(item) for item in regime_values})
+    for regime in unique_regimes:
+        regime_mask = np.asarray([str(item) == regime for item in regime_values], dtype=bool)
+        if int(np.sum(regime_mask)) == 0:
+            continue
+        out[regime] = _distribution(label_values[regime_mask])
+    return out
+
+
+def _threshold_uncertain_relation_export(
+    *,
+    labels: np.ndarray,
+    threshold_abs: np.ndarray,
+    mask: np.ndarray,
+    bins: int,
+) -> list[dict[str, float]]:
+    valid = mask.astype(bool) & np.isfinite(threshold_abs) & np.isfinite(labels)
+    if int(np.sum(valid)) < 20:
+        return []
+    values = threshold_abs[valid]
+    y = labels[valid].astype(int)
+    bin_count = max(3, int(bins))
+    edges = np.quantile(values, np.linspace(0.0, 1.0, bin_count + 1))
+    edges = np.asarray(edges, dtype=float)
+    for idx in range(1, edges.shape[0]):
+        if edges[idx] <= edges[idx - 1]:
+            edges[idx] = edges[idx - 1] + 1e-9
+    rows: list[dict[str, float]] = []
+    for idx in range(bin_count):
+        low = float(edges[idx])
+        high = float(edges[idx + 1])
+        if idx == bin_count - 1:
+            in_bin = (values >= low) & (values <= high)
+        else:
+            in_bin = (values >= low) & (values < high)
+        count = int(np.sum(in_bin))
+        if count == 0:
+            continue
+        rows.append(
+            {
+                "bucket": float(idx),
+                "low": low,
+                "high": high,
+                "count": float(count),
+                "uncertain_rate": float(np.mean(y[in_bin] == LABEL_FLAT)),
+            }
+        )
+    return rows
+
+
+def _calibration_flip_summary_export(
+    *,
+    raw_probs: np.ndarray,
+    calibrated_probs: np.ndarray,
+    labels: np.ndarray,
+    eps: float,
+) -> dict[str, float]:
+    if raw_probs.shape[0] == 0:
+        return {}
+    raw_major = np.argmax(raw_probs, axis=1)
+    cal_major = np.argmax(calibrated_probs, axis=1)
+    raw_top1 = np.max(raw_probs, axis=1)
+    cal_top1 = np.max(calibrated_probs, axis=1)
+    sorted_raw = np.sort(raw_probs, axis=1)
+    raw_margin = sorted_raw[:, -1] - sorted_raw[:, -2]
+    flip_mask = raw_major != cal_major
+    flip_count = int(np.sum(flip_mask))
+
+    y = labels.astype(int)
+    idx = np.arange(y.shape[0], dtype=int)
+    raw_ll = -np.log(np.clip(raw_probs[idx, y], eps, 1.0))
+    cal_ll = -np.log(np.clip(calibrated_probs[idx, y], eps, 1.0))
+    onehot = np.eye(3)[y]
+    raw_brier = np.sum((raw_probs - onehot) ** 2, axis=1)
+    cal_brier = np.sum((calibrated_probs - onehot) ** 2, axis=1)
+
+    strong_mask = (raw_margin >= 0.20) & (raw_major != LABEL_FLAT)
+    strong_count = int(np.sum(strong_mask))
+    strong_to_uncertain = (
+        float(np.mean(cal_major[strong_mask] == LABEL_FLAT))
+        if strong_count > 0
+        else 0.0
+    )
+    flip_ll_improve = (
+        float(np.mean(cal_ll[flip_mask] < raw_ll[flip_mask]))
+        if flip_count > 0
+        else 0.0
+    )
+    flip_brier_improve = (
+        float(np.mean(cal_brier[flip_mask] < raw_brier[flip_mask]))
+        if flip_count > 0
+        else 0.0
+    )
+    return {
+        "flip_rate": float(np.mean(flip_mask)),
+        "flip_count": float(flip_count),
+        "raw_top1_prob_mean": float(np.mean(raw_top1)),
+        "cal_top1_prob_mean": float(np.mean(cal_top1)),
+        "flip_logloss_improve_rate": flip_ll_improve,
+        "flip_brier_improve_rate": flip_brier_improve,
+        "strong_direction_to_uncertain_rate": strong_to_uncertain,
     }
 
 
@@ -1256,9 +2151,19 @@ def _write_sample_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "cal_up",
         "cal_down",
         "cal_uncertain",
+        "post_shrink_up",
+        "post_shrink_down",
+        "post_shrink_uncertain",
+        "post_uncertainty_boost_up",
+        "post_uncertainty_boost_down",
+        "post_uncertainty_boost_uncertain",
         "final_up",
         "final_down",
         "final_uncertain",
+        "regime_shift_boost_delta",
+        "high_vol_boost_delta",
+        "total_uncertain_boost_delta",
+        "uncertain_ceiling_applied",
         "state",
         "internal_state",
         "label",
@@ -1317,6 +2222,113 @@ def _write_ablation_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "final_up",
         "final_down",
         "final_uncertain",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _write_short_v2_samples_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    fieldnames = [
+        "date",
+        "symbol",
+        "split",
+        "actual_label",
+        "raw_up",
+        "raw_down",
+        "raw_uncertain",
+        "cal_up",
+        "cal_down",
+        "cal_uncertain",
+        "raw_top1",
+        "cal_top1",
+        "raw_top1_prob",
+        "cal_top1_prob",
+        "raw_margin",
+        "cal_margin",
+        "mu",
+        "sigma",
+        "mu_sigma_abs",
+        "regime",
+        "vol_bucket",
+        "trend_bucket",
+        "drawdown_bucket",
+        "regime_combo",
+        "regime_combo_drawdown",
+        "raw_correct",
+        "cal_correct",
+        "flipped",
+        "flip_improved",
+        "raw_logloss",
+        "cal_logloss",
+        "raw_brier",
+        "cal_brier",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _write_short_v2_bucket_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    fieldnames = [
+        "bucket_type",
+        "bucket_name",
+        "count",
+        "weight",
+        "raw_top1_acc",
+        "cal_top1_acc",
+        "acc_delta",
+        "raw_logloss",
+        "cal_logloss",
+        "logloss_delta",
+        "raw_brier",
+        "cal_brier",
+        "brier_delta",
+        "flip_rate",
+        "flip_improve_rate",
+        "raw_top1_share",
+        "cal_top1_share",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _write_short_v2_candidates_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    fieldnames = [
+        "bucket_type",
+        "bucket_name",
+        "count",
+        "weight",
+        "raw_top1_acc",
+        "cal_top1_acc",
+        "acc_delta",
+        "raw_logloss",
+        "cal_logloss",
+        "logloss_delta",
+        "raw_brier",
+        "cal_brier",
+        "brier_delta",
+        "flip_rate",
+        "flip_improve_rate",
+        "raw_top1_share",
+        "cal_top1_share",
+        "min_count",
+        "acc_thresh",
+        "logloss_thresh",
+        "flip_thresh",
+        "count_ok",
+        "acc_ok",
+        "logloss_ok",
+        "flip_ok",
+        "suggest_guard",
+        "suggest_alpha_range",
     ]
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -1486,6 +2498,9 @@ def _write_detail_markdown(
     diagnostics: dict[str, Any],
     summary_path: Path,
     sample_path: Path,
+    short_v2_samples_path: Path,
+    short_v2_bucket_path: Path,
+    short_v2_candidates_path: Path,
     json_path: Path,
     ablation_path: Path,
 ) -> None:
@@ -1537,6 +2552,23 @@ def _write_detail_markdown(
         lines.append(
             "- test: {0}".format(_dist_str(detail["label_distribution"]["test"]))
         )
+        recent = detail.get("recent_label_distribution", {})
+        if isinstance(recent, dict) and recent:
+            recent_dist = recent.get("distribution", {})
+            lines.append(
+                "- recent_window[{rows}]: {dist}".format(
+                    rows=int(recent.get("window_rows", 0)),
+                    dist=_dist_str(recent_dist) if isinstance(recent_dist, dict) else "-",
+                )
+            )
+        by_regime = detail.get("label_distribution_by_regime", {})
+        if isinstance(by_regime, dict) and by_regime:
+            lines.append("- by_regime(train): `{}`".format(by_regime.get("train", {})))
+            lines.append("- by_regime(valid): `{}`".format(by_regime.get("valid", {})))
+            lines.append("- by_regime(test): `{}`".format(by_regime.get("test", {})))
+        threshold_bins = detail.get("threshold_uncertain_bins", [])
+        if isinstance(threshold_bins, list) and threshold_bins:
+            lines.append("- threshold_vs_uncertain: `{}`".format(threshold_bins))
         lines.append("")
         lines.append("#### 测试集链路指标 (raw vs calibrated vs final)")
         lines.append("")
@@ -1560,15 +2592,54 @@ def _write_detail_markdown(
             f"- avg final probs(up/down/uncertain): {chain['avg_final_probs']['up']:.4f} / {chain['avg_final_probs']['down']:.4f} / {chain['avg_final_probs']['uncertain']:.4f}"
         )
         lines.append(f"- avg signal_strength: {chain['avg_signal_strength']:.4f}")
+        lines.append(
+            f"- avg boost delta(regime/high_vol/total): "
+            f"{chain['avg_regime_shift_boost_delta']:.4f} / "
+            f"{chain['avg_high_vol_boost_delta']:.4f} / "
+            f"{chain['avg_total_uncertain_boost_delta']:.4f}"
+        )
+        lines.append(
+            f"- avg uncertain(raw/final): {chain['avg_raw_uncertain']:.4f} / {chain['avg_final_uncertain']:.4f}"
+        )
+        lines.append(
+            f"- uncertain ceiling applied ratio: {chain['uncertain_ceiling_applied_ratio']:.4f}"
+        )
         lines.append(f"- predicted class count(final): `{chain['predicted_class_count_final']}`")
+        flip_summary = detail.get("calibration_flip_summary", {})
+        if isinstance(flip_summary, dict) and flip_summary:
+            lines.append(
+                "- calibration flip summary: "
+                f"flip_rate={flip_summary.get('flip_rate', 0.0):.4f}, "
+                f"flip_count={int(flip_summary.get('flip_count', 0))}, "
+                f"raw_top1_mean={flip_summary.get('raw_top1_prob_mean', 0.0):.4f}, "
+                f"cal_top1_mean={flip_summary.get('cal_top1_prob_mean', 0.0):.4f}, "
+                f"flip_logloss_improve={flip_summary.get('flip_logloss_improve_rate', 0.0):.4f}, "
+                f"flip_brier_improve={flip_summary.get('flip_brier_improve_rate', 0.0):.4f}, "
+                f"strong_to_uncertain={flip_summary.get('strong_direction_to_uncertain_rate', 0.0):.4f}"
+            )
+        short_guard_stats = detail.get("short_guard_stats", {})
+        if isinstance(short_guard_stats, dict) and short_guard_stats:
+            guard_view = short_guard_stats.get("test", short_guard_stats)
+            lines.append(
+                "- short_guard_stats(test): "
+                f"enabled={bool(short_guard_stats.get('enabled', False))}, "
+                f"trigger_rate={float(guard_view.get('trigger_rate', 0.0)):.4f}, "
+                f"trigger_count={int(guard_view.get('trigger_count', 0))}, "
+                f"triggered_flip_rate={float(guard_view.get('triggered_flip_rate', 0.0)):.4f}, "
+                f"triggered_raw_top1_acc={float(guard_view.get('triggered_raw_top1_acc', 0.0)):.4f}, "
+                f"triggered_guard_top1_acc={float(guard_view.get('triggered_guard_top1_acc', 0.0)):.4f}, "
+                f"triggered_logloss={float(guard_view.get('triggered_logloss', 0.0)):.4f}, "
+                f"triggered_brier={float(guard_view.get('triggered_brier', 0.0)):.4f}, "
+                f"triggered_to_uncertain_rate={float(guard_view.get('triggered_to_uncertain_rate', 0.0)):.4f}"
+            )
         lines.append("")
         lines.append("#### 最近测试样本（链路明细）")
         lines.append("")
-        lines.append("| date | actual | raw(up/down/uncertain) | cal(up/down/uncertain) | final(up/down/uncertain) | state | label | headline | display | top1/top2/margin | signal_strength | warning | pred_final |")
-        lines.append("|---|---|---|---|---|---|---|---|---|---|---:|---|---|")
+        lines.append("| date | actual | raw(up/down/uncertain) | cal(up/down/uncertain) | post_shrink(up/down/uncertain) | post_boost(up/down/uncertain) | final(up/down/uncertain) | boost_delta(regime/high/total) | ceiling | state | label | headline | display | top1/top2/margin | signal_strength | warning | pred_final |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---:|---|---|")
         for row in detail["recent_test_rows"]:
             lines.append(
-                "| {date} | {actual} | {ru:.3f}/{rd:.3f}/{runc:.3f} | {cu:.3f}/{cd:.3f}/{cunc:.3f} | {fu:.3f}/{fd:.3f}/{func:.3f} | {state} | {label} | {headline} | {display} | {top1:.3f}/{top2:.3f}/{margin:.3f} | {signal:.3f} | {warning} | {pred} |".format(
+                "| {date} | {actual} | {ru:.3f}/{rd:.3f}/{runc:.3f} | {cu:.3f}/{cd:.3f}/{cunc:.3f} | {su:.3f}/{sd:.3f}/{sunc:.3f} | {bu:.3f}/{bd:.3f}/{bunc:.3f} | {fu:.3f}/{fd:.3f}/{func:.3f} | {d1:.3f}/{d2:.3f}/{d3:.3f} | {ceiling} | {state} | {label} | {headline} | {display} | {top1:.3f}/{top2:.3f}/{margin:.3f} | {signal:.3f} | {warning} | {pred} |".format(
                     date=row["date"],
                     actual=row["actual_label"],
                     ru=row["raw_up"],
@@ -1577,9 +2648,19 @@ def _write_detail_markdown(
                     cu=row["cal_up"],
                     cd=row["cal_down"],
                     cunc=row["cal_uncertain"],
+                    su=row["post_shrink_up"],
+                    sd=row["post_shrink_down"],
+                    sunc=row["post_shrink_uncertain"],
+                    bu=row["post_uncertainty_boost_up"],
+                    bd=row["post_uncertainty_boost_down"],
+                    bunc=row["post_uncertainty_boost_uncertain"],
                     fu=row["final_up"],
                     fd=row["final_down"],
                     func=row["final_uncertain"],
+                    d1=row["regime_shift_boost_delta"],
+                    d2=row["high_vol_boost_delta"],
+                    d3=row["total_uncertain_boost_delta"],
+                    ceiling="yes" if row["uncertain_ceiling_applied"] else "no",
                     state=row["internal_state"],
                     label=row["label"],
                     headline=row["headline_label"],
@@ -1675,6 +2756,9 @@ def _write_detail_markdown(
     lines.append("")
     lines.append(f"- summary csv: `{summary_path}`")
     lines.append(f"- sample predictions csv: `{sample_path}`")
+    lines.append(f"- short v2 samples csv: `{short_v2_samples_path}`")
+    lines.append(f"- short v2 bucket report csv: `{short_v2_bucket_path}`")
+    lines.append(f"- short v2 candidates csv: `{short_v2_candidates_path}`")
     lines.append(f"- diagnostics json: `{json_path}`")
     lines.append(f"- ablation csv: `{ablation_path}`")
     lines.append("")

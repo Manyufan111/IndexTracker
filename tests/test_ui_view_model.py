@@ -54,6 +54,8 @@ class UIViewModelTests(unittest.TestCase):
             scenarios=scenarios,
             data_status=status,
             used_cache_fallback=False,
+            latest_pe=24.36,
+            pe_source="yahoo_finance_primary_quote:index_quote",
             horizon_outputs={
                 "short": HorizonProbabilityOutput(
                     horizon="short",
@@ -158,8 +160,10 @@ class UIViewModelTests(unittest.TestCase):
         self.assertIn("raw", card.probability_detail_lines[0])
         self.assertIn("calibrated", card.probability_detail_lines[0])
         self.assertIn("final", card.probability_detail_lines[0])
+        self.assertEqual(card.pe_line, "最新 PE(TTM): 24.36")
+        self.assertEqual(card.pe_source_line, "PE 来源: yahoo_finance_primary_quote:index_quote")
 
-    def test_legacy_mode_method_and_detail_hint(self) -> None:
+    def test_quantile_mode_without_prob_detail_shows_hint(self) -> None:
         candles = [
             Candle(
                 symbol="SP500",
@@ -188,7 +192,7 @@ class UIViewModelTests(unittest.TestCase):
         card = build_index_card_view_model(
             symbol="SP500",
             period="1M",
-            model_mode="legacy",
+            model_mode="quantile",
             candles=candles,
             summary_zh="测试结论",
             scenarios=scenarios,
@@ -196,9 +200,11 @@ class UIViewModelTests(unittest.TestCase):
             used_cache_fallback=False,
             horizon_outputs=None,
         )
-        self.assertIn("当前模型: legacy", card.method_line)
+        self.assertIn("当前模型: quantile", card.method_line)
         self.assertEqual(len(card.probability_detail_lines), 1)
         self.assertIn("未输出 raw/calibrated", card.probability_detail_lines[0])
+        self.assertEqual(card.pe_line, "最新 PE(TTM): 暂无数据")
+        self.assertEqual(card.pe_source_line, "PE 来源: unavailable")
 
 
 if __name__ == "__main__":

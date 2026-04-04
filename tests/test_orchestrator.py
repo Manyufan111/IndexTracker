@@ -68,7 +68,7 @@ class CliIntegrationTests(unittest.TestCase):
                     "--period",
                     "1M",
                     "--model",
-                    "legacy",
+                    "quantile",
                     "--db-path",
                     str(db_path),
                     "--log-path",

@@ -36,12 +36,15 @@ class UIDisclosureTests(unittest.TestCase):
             ],
             source_line="数据源: yahoo_finance_primary",
             method_line="分析方法: 特征+评分+概率",
+            pe_line="最新 PE(TTM): 24.10",
         )
         html = render_dashboard_page(
             cards=[card],
             period="1M",
             generated_at="2026-04-01 10:00:00",
-            model_mode="legacy",
+            vix_value=21.43,
+            vix_source="fred_vixcls_csv",
+            model_mode="quantile",
             ui_notice="测试提示",
         )
         self.assertIn("IndexTrack 趋势总览", html)
@@ -49,10 +52,11 @@ class UIDisclosureTests(unittest.TestCase):
         self.assertIn("查看数据来源与分析方法", html)
         self.assertIn("S&amp;P 500", html)
         self.assertIn("calibrated", html)
-        self.assertIn("Quantile 模型", html)
-        self.assertIn("Legacy 模型", html)
-        self.assertIn("model=legacy", html)
+        self.assertIn("model=quantile", html)
         self.assertIn("测试提示", html)
+        self.assertIn("恐慌指数 VIX：21.43", html)
+        self.assertIn("最新 PE(TTM): 24.10", html)
+        self.assertIn("VIX 来源：fred_vixcls_csv", html)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,17 @@ class RepositoryStats:
     last_trade_date: date
 
 
+@dataclass(frozen=True)
+class MetaCacheEntry:
+    """Cached market meta value (PE/VIX) for fallback."""
+
+    key: str
+    value: float
+    source: str
+    fetched_at: datetime
+    note: str | None = None
+
+
 class SQLiteRepository:
     """Persist normalized candles and fetch snapshots in SQLite."""
 
@@ -148,6 +159,67 @@ class SQLiteRepository:
             row_count=int(row["row_count"]),
         )
 
+    def save_market_meta(
+        self,
+        *,
+        key: str,
+        value: float,
+        source: str,
+        fetched_at: datetime,
+        note: str | None = None,
+    ) -> None:
+        normalized_key = key.strip().upper()
+        if not normalized_key:
+            raise ValueError("meta key 不能为空")
+        if not source.strip():
+            raise ValueError("meta source 不能为空")
+
+        with closing(self._connect()) as conn:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO market_meta_cache (key, value, source, fetched_at, note)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value=excluded.value,
+                        source=excluded.source,
+                        fetched_at=excluded.fetched_at,
+                        note=excluded.note
+                    """,
+                    (
+                        normalized_key,
+                        float(value),
+                        source,
+                        fetched_at.isoformat(),
+                        note,
+                    ),
+                )
+
+    def load_market_meta(self, *, key: str) -> MetaCacheEntry | None:
+        normalized_key = key.strip().upper()
+        if not normalized_key:
+            raise ValueError("meta key 不能为空")
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(
+                """
+                SELECT key, value, source, fetched_at, note
+                FROM market_meta_cache
+                WHERE key = ?
+                LIMIT 1
+                """,
+                (normalized_key,),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return MetaCacheEntry(
+            key=row["key"],
+            value=float(row["value"]),
+            source=row["source"],
+            fetched_at=datetime.fromisoformat(row["fetched_at"]),
+            note=row["note"],
+        )
+
     def _initialize(self) -> None:
         with closing(self._connect()) as conn:
             with conn:
@@ -183,6 +255,17 @@ class SQLiteRepository:
                     """
                     CREATE INDEX IF NOT EXISTS idx_snapshots_symbol_fetched_at
                     ON snapshots(symbol, fetched_at DESC)
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS market_meta_cache (
+                        key TEXT PRIMARY KEY,
+                        value REAL NOT NULL,
+                        source TEXT NOT NULL,
+                        fetched_at TEXT NOT NULL,
+                        note TEXT NULL
+                    )
                     """
                 )
 

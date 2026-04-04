@@ -1,5 +1,5 @@
 """Repository package."""
 
-from .sqlite_repo import RepositoryStats, SQLiteRepository
+from .sqlite_repo import MetaCacheEntry, RepositoryStats, SQLiteRepository
 
-__all__ = ["SQLiteRepository", "RepositoryStats"]
+__all__ = ["SQLiteRepository", "RepositoryStats", "MetaCacheEntry"]

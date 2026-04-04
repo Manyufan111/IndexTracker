@@ -41,6 +41,8 @@ class IndexCardViewModel:
     probability_detail_lines: list[str] = field(default_factory=list)
     source_line: str = ""
     method_line: str = ""
+    pe_line: str = ""
+    pe_source_line: str = ""
 
 
 def build_index_card_view_model(
@@ -54,6 +56,8 @@ def build_index_card_view_model(
     data_status: DataStatus,
     used_cache_fallback: bool,
     horizon_outputs: dict[str, Any] | None = None,
+    latest_pe: float | None = None,
+    pe_source: str | None = None,
 ) -> IndexCardViewModel:
     """Build a UI card model from analysis outputs."""
     normalized_period = period.strip().upper()
@@ -69,7 +73,7 @@ def build_index_card_view_model(
     detail_lines = _format_probability_detail_lines(horizon_outputs or {})
     if not detail_lines:
         detail_lines = [
-            "当前模型未输出 raw/calibrated 概率明细（请切换 quantile 模型查看）。"
+            "当前结果未输出 raw/calibrated 概率明细（请检查数据窗口与模型日志）。"
         ]
 
     source_chunks = [
@@ -84,13 +88,14 @@ def build_index_card_view_model(
         source_chunks.append(f"提示: {data_status.note}")
     source_line = "；".join(source_chunks)
 
-    normalized_mode = model_mode.strip().lower()
-    if normalized_mode == "quantile":
-        method_line = (
-            "当前模型: quantile（分位数回归 q10/q50/q90 + OOF 多分类校准 + 三分类主链路 + 二分类展示层校准与约束）。"
-        )
-    else:
-        method_line = "当前模型: legacy（趋势/动量/波动规则引擎加权评分）。"
+    _ = model_mode  # keep signature stable for page/query compatibility.
+    method_line = (
+        "当前模型: quantile（分位数回归 q10/q50/q90 + OOF 多分类校准 + 三分类主链路 + 二分类展示层校准与约束）。"
+    )
+    pe_line = (
+        f"最新 PE(TTM): {latest_pe:.2f}" if latest_pe is not None else "最新 PE(TTM): 暂无数据"
+    )
+    pe_source_line = f"PE 来源: {pe_source or 'unavailable'}"
 
     return IndexCardViewModel(
         symbol=symbol,
@@ -102,6 +107,8 @@ def build_index_card_view_model(
         probability_detail_lines=detail_lines,
         source_line=source_line,
         method_line=method_line,
+        pe_line=pe_line,
+        pe_source_line=pe_source_line,
     )
 
 
@@ -130,11 +137,11 @@ def _format_probability_detail_lines(
             f"{label} 明细: raw(上/下/不确定) "
             f"{item.display_prob_up_raw * 100:.1f}%/"
             f"{item.display_prob_down_raw * 100:.1f}%/"
-            f"{item.display_prob_uncertain * 100:.1f}% | "
+            f"{item.display_prob_uncertain_raw * 100:.1f}% | "
             f"calibrated(上/下/不确定) "
             f"{item.display_prob_up_calibrated * 100:.1f}%/"
             f"{item.display_prob_down_calibrated * 100:.1f}%/"
-            f"{item.display_prob_uncertain * 100:.1f}% | "
+            f"{item.display_prob_uncertain_calibrated * 100:.1f}% | "
             f"final(上/下/不确定) "
             f"{item.display_prob_up * 100:.1f}%/"
             f"{item.display_prob_down * 100:.1f}%/"

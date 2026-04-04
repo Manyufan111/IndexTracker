@@ -8,7 +8,7 @@ from indextrack.infra.config import load_runtime_config
 
 
 class ProbabilityProfileConfigTests(unittest.TestCase):
-    def test_baseline_profile_restores_legacy_quantile_defaults(self) -> None:
+    def test_baseline_profile_restores_quantile_baseline_defaults(self) -> None:
         config = load_runtime_config(
             {
                 "INDEXTRACK_PROB_PROFILE": "baseline",
@@ -18,6 +18,7 @@ class ProbabilityProfileConfigTests(unittest.TestCase):
         self.assertEqual(prob.profile, "baseline")
         self.assertAlmostEqual(prob.k_60, 0.65)
         self.assertAlmostEqual(prob.lambda_60, 0.70)
+        self.assertAlmostEqual(prob.long_high_vol_strong_trend_scale, 1.00)
         self.assertAlmostEqual(prob.display_prob_cap, 0.90)
         self.assertEqual(prob.calibrator_mode, "softmax")
         self.assertEqual(prob.calibrator_mode_5, "softmax")
@@ -31,6 +32,7 @@ class ProbabilityProfileConfigTests(unittest.TestCase):
         prob = config.probability_model
         self.assertEqual(prob.profile, "optimized_v1")
         self.assertAlmostEqual(prob.k_60, 0.60)
+        self.assertAlmostEqual(prob.long_high_vol_strong_trend_scale, 1.00)
         self.assertAlmostEqual(prob.lambda_20, 1.0)
         self.assertAlmostEqual(prob.lambda_60, 1.0)
         self.assertAlmostEqual(prob.display_prob_cap, 0.90)

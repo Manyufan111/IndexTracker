@@ -26,6 +26,12 @@ PROB_SIGMA_FLOOR20_ENV = "INDEXTRACK_PROB_SIGMA_FLOOR_20"
 PROB_SIGMA_FLOOR60_ENV = "INDEXTRACK_PROB_SIGMA_FLOOR_60"
 PROB_CAP_ENV = "INDEXTRACK_PROB_CAP"
 DISPLAY_PROB_CAP_ENV = "INDEXTRACK_DISPLAY_PROB_CAP"
+PROB_LONG_HV_STRONG_TREND_SCALE_ENV = "INDEXTRACK_PROB_LONG_HV_STRONG_TREND_SCALE"
+PROB_SHORT_GUARD_ENABLE_ENV = "INDEXTRACK_PROB_SHORT_GUARD_ENABLE"
+PROB_SHORT_GUARD_MARGIN_ENV = "INDEXTRACK_PROB_SHORT_GUARD_MARGIN"
+PROB_SHORT_GUARD_UNCERTAIN_ENV = "INDEXTRACK_PROB_SHORT_GUARD_UNCERTAIN"
+PROB_SHORT_GUARD_MU_SIGMA_ENV = "INDEXTRACK_PROB_SHORT_GUARD_MU_SIGMA"
+PROB_SHORT_GUARD_ALPHA_ENV = "INDEXTRACK_PROB_SHORT_GUARD_ALPHA"
 PROB_OOF_SPLITS_ENV = "INDEXTRACK_PROB_OOF_SPLITS"
 PROB_MIN_TRAIN_ENV = "INDEXTRACK_PROB_MIN_TRAIN_SIZE"
 PROB_MIN_VALID_ENV = "INDEXTRACK_PROB_MIN_VALID_SIZE"
@@ -56,7 +62,7 @@ DEFAULT_SCENARIO_LONG_WEIGHTS = (1.6, 0.9, 0.4, 0.9, 0.25)
 DEFAULT_MODEL_MODE = "quantile"
 
 VALID_INDEX_OPTIONS = {"SP500", "NASDAQ", "BOTH"}
-VALID_MODEL_OPTIONS = {"legacy", "quantile"}
+VALID_MODEL_OPTIONS = {"quantile"}
 VALID_CALIBRATOR_MODES = {"softmax", "conservative", "none"}
 VALID_PROB_PROFILES = {"baseline", "optimized_v1"}
 
@@ -102,6 +108,12 @@ class ProbabilityModelRuntimeConfig:
     sigma_floor_20: float
     sigma_floor_60: float
     prob_cap: float
+    long_high_vol_strong_trend_scale: float
+    short_guard_enabled: bool
+    short_guard_margin: float
+    short_guard_uncertain_max: float
+    short_guard_mu_sigma_min: float
+    short_guard_alpha: float
     display_prob_cap: float
     oof_splits: int
     min_train_size: int
@@ -141,7 +153,7 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
     model_mode = _read_str(source, MODEL_MODE_ENV, DEFAULT_MODEL_MODE).lower()
     if model_mode not in VALID_MODEL_OPTIONS:
         raise ConfigError(
-            f"{MODEL_MODE_ENV} 必须是 legacy/quantile，当前值为: {model_mode}"
+            f"{MODEL_MODE_ENV} 必须是 quantile，当前值为: {model_mode}"
         )
     prob_profile = _read_str(source, PROB_PROFILE_ENV, "optimized_v1").lower()
     if prob_profile not in VALID_PROB_PROFILES:
@@ -198,6 +210,11 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
             k_5=_read_float(source, PROB_K5_ENV, profile_defaults["k_5"]),
             k_20=_read_float(source, PROB_K20_ENV, profile_defaults["k_20"]),
             k_60=_read_float(source, PROB_K60_ENV, profile_defaults["k_60"]),
+            long_high_vol_strong_trend_scale=_read_float(
+                source,
+                PROB_LONG_HV_STRONG_TREND_SCALE_ENV,
+                profile_defaults["long_high_vol_strong_trend_scale"],
+            ),
             lambda_5=_read_float(source, PROB_LAMBDA5_ENV, profile_defaults["lambda_5"]),
             lambda_20=_read_float(source, PROB_LAMBDA20_ENV, profile_defaults["lambda_20"]),
             lambda_60=_read_float(source, PROB_LAMBDA60_ENV, profile_defaults["lambda_60"]),
@@ -225,6 +242,11 @@ def load_runtime_config(env: Mapping[str, str] | None = None) -> RuntimeConfig:
             calibration_max_shift_20=_read_float(source, PROB_CALIB_SHIFT20_ENV, profile_defaults["calibration_max_shift_20"]),
             calibration_max_shift_60=_read_float(source, PROB_CALIB_SHIFT60_ENV, profile_defaults["calibration_max_shift_60"]),
             profile=prob_profile,
+            short_guard_enabled=_read_bool(source, PROB_SHORT_GUARD_ENABLE_ENV, profile_defaults["short_guard_enabled"]),
+            short_guard_margin=_read_float(source, PROB_SHORT_GUARD_MARGIN_ENV, profile_defaults["short_guard_margin"]),
+            short_guard_uncertain_max=_read_float(source, PROB_SHORT_GUARD_UNCERTAIN_ENV, profile_defaults["short_guard_uncertain_max"]),
+            short_guard_mu_sigma_min=_read_float(source, PROB_SHORT_GUARD_MU_SIGMA_ENV, profile_defaults["short_guard_mu_sigma_min"]),
+            short_guard_alpha=_read_float(source, PROB_SHORT_GUARD_ALPHA_ENV, profile_defaults["short_guard_alpha"]),
         ),
     )
 
@@ -240,6 +262,18 @@ def _read_optional_str(source: Mapping[str, str], name: str) -> str | None:
         return None
     cleaned = value.strip()
     return cleaned or None
+
+
+def _read_bool(source: Mapping[str, str], name: str, default: bool) -> bool:
+    raw = source.get(name)
+    if raw is None:
+        return default
+    cleaned = raw.strip().lower()
+    if cleaned in {"1", "true", "yes", "y", "on"}:
+        return True
+    if cleaned in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
 
 
 def _read_int(source: Mapping[str, str], name: str, default: int) -> int:
@@ -308,6 +342,12 @@ def _probability_profile_defaults(profile: str) -> dict[str, float | str]:
             "k_5": 0.35,
             "k_20": 0.50,
             "k_60": 0.65,
+            "long_high_vol_strong_trend_scale": 1.00,
+            "short_guard_enabled": False,
+            "short_guard_margin": 0.20,
+            "short_guard_uncertain_max": 0.30,
+            "short_guard_mu_sigma_min": 1.00,
+            "short_guard_alpha": 0.70,
             "lambda_5": 0.80,
             "lambda_20": 0.75,
             "lambda_60": 0.70,
@@ -332,6 +372,12 @@ def _probability_profile_defaults(profile: str) -> dict[str, float | str]:
         "k_5": 0.35,
         "k_20": 0.50,
         "k_60": 0.60,
+        "long_high_vol_strong_trend_scale": 1.00,
+        "short_guard_enabled": False,
+        "short_guard_margin": 0.20,
+        "short_guard_uncertain_max": 0.30,
+        "short_guard_mu_sigma_min": 1.00,
+        "short_guard_alpha": 0.70,
         "lambda_5": 0.80,
         "lambda_20": 1.00,
         "lambda_60": 1.00,
@@ -344,7 +390,8 @@ def _probability_profile_defaults(profile: str) -> dict[str, float | str]:
         "calibrator_mode_5": "conservative",
         "calibrator_mode_20": "none",
         "calibrator_mode_60": "none",
-        "calibrator_temperature": 1.35,
+        # A1 default for short calibrator: keep conservative mode but use milder scaling.
+        "calibrator_temperature": 1.60,
         "calibration_blend_5": 1.00,
         "calibration_blend_20": 0.00,
         "calibration_blend_60": 0.00,

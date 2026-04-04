@@ -69,7 +69,7 @@ class ReportZhTests(unittest.TestCase):
                 "long": "mild_down",
             },
         )
-        self.assertIn("短期偏上、中期不确定、长期偏下", report.summary_zh)
+        self.assertIn("短期偏多但置信一般、中期中性/不确定、长期偏空但置信一般", report.summary_zh)
 
 
 if __name__ == "__main__":

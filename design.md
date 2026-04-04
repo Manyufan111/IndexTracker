@@ -124,8 +124,11 @@ flowchart LR
 
 ### 6.3 UI 组件设计（新增）
 - `TrendChartCard`
-  - 职责：展示单个指数趋势图（标题 + 时间范围 + 数据点）。
+  - 职责：展示单个指数趋势图（标题 + 时间范围 + 数据点 + 图下 PE）。
   - 约束：图表时间范围与分析结论必须同源同时间戳。
+- `HeaderMetaBadge`
+  - 职责：在页面右上角展示全局市场状态（当前为 `VIX`）。
+  - 约束：若实时拉取失败，按 `Yahoo -> AlphaVantage(可选) -> FRED -> 缓存 -> seed(本地/内置)` 逐级回退；仍失败则显示 `N/A` 并不阻断主页面渲染。
 - `TrendAnalysisBlock`
   - 职责：在趋势图下展示该指数走势分析文本。
   - 约束：文案简洁，避免与图表数据冲突。
@@ -258,6 +261,14 @@ IndexTrack/
   - `k_5=0.35`
   - `k_20=0.50`
   - `k_60` 采用 profile 化默认：
+
+## 16. 阶段收口与默认策略（2026-04）
+- `long` 路线收口：保持 `raw-only`（`mid/long` 默认不启用 calibrator），`baseline` 保留。
+- `short guard` 路线收口：`v1/v2` 诊断后均未形成稳定收益，默认保持关闭，不再作为主线优化方向。
+- `short calibrator` 默认升级为 `A1 simpler calibrator`：
+  - short 保持 `conservative` 模式；
+  - 默认 `calibrator_temperature` 提升至 `1.60`，用于降低过度翻盘风险并提升概率质量。
+- 本阶段不再继续推进 `A2/A3`、display 约束微调与 short guard 阈值微调，后续优化聚焦 calibrator 本体与 raw 概率层。
     - `baseline`: `0.65`
     - `optimized_v1`: `0.60`
 - 标签：
@@ -445,7 +456,7 @@ IndexTrack/
   - `mid/long` 若 binary calibration 劣化，则自动禁用校准器（回退 raw）。
 
 ### 2026-04-01（量化概率模型升级）
-- 新增 `quantile` 模型链路（保留 `legacy` 以便 A/B）：
+- 新增 `quantile` 模型链路（现已统一为单模型运行）：
   - 新模块：`feature_engineering.py`、`label_builder.py`、`quantile_model.py`、`probability_mapper.py`、`calibrator.py`、`evaluator.py`、`model.py`。
   - 新接口：`MarketProbabilityModel.fit / predict_proba / predict / backtest`。
 - 训练方式升级：
@@ -476,3 +487,44 @@ IndexTrack/
   - mid：`raw / raw+shrinkage / raw+current calibration / raw+conservative calibration`；
   - long：`raw / raw+mild shrinkage / raw+current calibration / raw+conservative calibration`；
   - 追加 `long_threshold`、`long_lambda`、`calibration_recent_window`、`prior_adjustment` 实验组。
+
+### 2026-04-03（display pipeline 稳健性修订）
+- 目标：避免 `long` 在 `raw_uncertain` 已较高时被展示层继续过度推高。
+- 新增 horizon-specific 展示层参数：
+  - `display_regime_shift_uncertain_boost_{5,20,60}`
+  - `display_high_vol_uncertain_boost_{5,20,60}`
+  - `display_max_total_uncertain_boost_{5,20,60}`
+  - `display_uncertain_ceiling_{5,20,60}`（默认 long=0.75）
+- 新增 raw-aware boost 衰减逻辑：
+  - `raw_uncertain >= 0.65` 开始衰减；
+  - `raw_uncertain >= 0.75` 近似停用额外 boost。
+- 展示链路新增中间阶段导出：
+  - `post_shrink_probs`
+  - `post_uncertainty_boost_probs`
+  - 并输出 `regime_shift_boost_delta/high_vol_boost_delta/total_uncertain_boost_delta/uncertain_ceiling_applied`。
+
+### 2026-04-03（模型层前移 + 轻展示护栏）
+- 概率主链路升级为“多分位数分段分布映射”：
+  - 默认量化点扩展为 `0.05/0.10/0.15/0.25/0.50/0.75/0.85/0.90/0.95`；
+  - 从分位点插值近似条件分布，直接计算 `P(up/down/uncertain)`；
+  - 减少“仅用 q10/q50/q90 拟合高斯分布”的结构性偏差。
+- 标签升级为“状态条件化阈值”：
+  - 在 `k_h * vol * sqrt(h)` 基础上叠加 regime 因子（波动比、趋势强度、回撤深度）；
+  - 缓解高波动期 flat（不确定）标签过多导致的单一保守偏置。
+- shrinkage 升级为“按样本动态 lambda(x)”：
+  - 依据 `top1-top2 margin`、uncertain 比例、`|mu|/sigma` 动态调整收缩强度；
+  - 再叠加 regime shift 惩罚，减少固定 `lambda_h` 的“一刀切”副作用。
+- 展示层回退为“文案保护器”：
+  - 默认关闭展示层二分类校准器（`display_use_binary_calibrator=false`）；
+  - 保留轻量 cap/告警，限制单次 uncertain 提升，且默认不允许改变 top1 排序。
+- 诊断导出与主链路对齐：
+  - 导出脚本同步使用多分位数映射与动态收缩接口；
+  - 保持 `raw/cal/final + post_shrink/post_uncertainty_boost` 可追踪口径。
+- 新增模型体检与校准诊断字段：
+  - `recent_label_distribution`（近端窗口标签分布）；
+  - `label_distribution_by_regime`（按 regime 分层标签占比）；
+  - `threshold_uncertain_bins`（threshold 与 uncertain 占比关系）；
+  - `calibration_flip_summary`（raw->cal top1 翻转率、翻转后 logloss/brier 改善率、强方向被打回 uncertain 比例）。
+- headline 文案升级为五档：
+  - `明确看多 / 偏多但置信一般 / 中性不确定 / 偏空但置信一般 / 明确看空`；
+  - 保留 `internal_state` 与 `display_label` 分层，避免“概率结构与标题文案不一致”。

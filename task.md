@@ -129,7 +129,7 @@
 | P704 | P0 | raw 概率映射与约束 | P703 | `probability_mapper.py` | 概率和为 1，支持 sigma_floor/lambda/cap | 3h |
 | P705 | P0 | 多分类概率校准器 | P704 | `calibrator.py` | OOF raw -> calibrated 可训练与推理 | 3h |
 | P706 | P1 | 评估模块与回测报告 | P705 | `evaluator.py` | logloss/brier/accuracy/混淆矩阵/校准分桶/regime 分层可输出 | 3h |
-| P707 | P0 | 统一接口与主流程接入 | P706 | `MarketProbabilityModel` + CLI `--model` 开关 | 支持 `fit/predict_proba/predict/backtest`，并可与 legacy A/B | 4h |
+| P707 | P0 | 统一接口与主流程接入 | P706 | `MarketProbabilityModel` + CLI `--model` 开关 | 支持 `fit/predict_proba/predict/backtest`，并完成 quantile 单模型接入 | 4h |
 | P708 | P0 | UI 概率细节展示（raw vs calibrated） | P707,U603 | UI 分析区扩展 | 前端可见 raw/calibrated、threshold、regime、confidence | 2.5h |
 | P709 | P0 | 概率模型测试与文档更新 | P707,P708 | `test_probability_model.py` + 文档 | 覆盖 no-leakage/prob-sum/monotonic/calibration pipeline | 3h |
 

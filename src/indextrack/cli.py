@@ -5,25 +5,19 @@ from __future__ import annotations
 import argparse
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo
 
 from indextrack.app.orchestrator import AnalysisOrchestrator, DataFetchOutcome, DataUnavailableError
-from indextrack.domain.features import FeatureEngine, FeatureError
+from indextrack.app.models import ScenarioProbs
+from indextrack.domain.features import FeatureError
 from indextrack.domain.report import ReportGenerator, ReportOutput
-from indextrack.domain.scenario import (
-    MomentumScorer,
-    ScenarioProbs,
-    ScenarioEngine,
-    VolatilityScorer,
-    build_horizon_weights,
-)
-from indextrack.domain.trend import TrendScorer
 from indextrack.infra.config import RuntimeConfig, load_runtime_config
 from indextrack.infra.freshness import FreshnessGuard
 from indextrack.infra.logging import setup_logging
 from indextrack.infra.providers.primary import YahooFinancePrimaryProvider
+from indextrack.infra.providers.quote import DashboardMarketMeta, YahooFinanceQuoteProvider
 from indextrack.infra.providers.router import ProviderRouter
 from indextrack.infra.providers.secondary import YahooFinanceSecondaryProvider
 from indextrack.infra.repository.sqlite_repo import SQLiteRepository
@@ -113,31 +107,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         freshness_guard=freshness_guard,
     )
 
-    scenario_engine = ScenarioEngine(
-        weights=build_horizon_weights(
-            short=config.scenario_weights.short,
-            mid=config.scenario_weights.mid,
-            long=config.scenario_weights.long,
-        )
-    )
     active_model_mode = args.model
-    probability_model_config: Any | None = None
-    if active_model_mode == "quantile":
-        try:
-            probability_model_config = _build_probability_model_config(config)
-        except FeatureError as exc:
-            logger.warning(
-                "quantile_dependency_missing_fallback_to_legacy reason=%s",
-                exc,
-            )
-            print(f"警告: {exc}")
-            print("已自动切换到 --model legacy 继续运行。")
-            active_model_mode = "legacy"
-    feature_engine = FeatureEngine()
-    trend_scorer = TrendScorer()
-    momentum_scorer = MomentumScorer()
-    volatility_scorer = VolatilityScorer()
+    try:
+        probability_model_config = _build_probability_model_config(config)
+    except FeatureError as exc:
+        message, suggestions = _friendly_error(exc)
+        print(f"错误: {message}")
+        if suggestions:
+            print("建议:")
+            for item in suggestions:
+                print(f"- {item}")
+        logger.exception("quantile_dependency_missing error=%s", exc)
+        return 1
     report_generator = ReportGenerator()
+    quote_provider = YahooFinanceQuoteProvider(request_timeout_sec=config.request_timeout_sec)
 
     if args.ui:
         return _run_ui_mode(
@@ -146,14 +129,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             port=args.ui_port,
             timezone=timezone,
             orchestrator=orchestrator,
-            feature_engine=feature_engine,
-            trend_scorer=trend_scorer,
-            momentum_scorer=momentum_scorer,
-            volatility_scorer=volatility_scorer,
-            scenario_engine=scenario_engine,
+            repository=repository,
             report_generator=report_generator,
             model_mode=active_model_mode,
             probability_model_config=probability_model_config,
+            quote_provider=quote_provider,
         )
 
     had_failure = False
@@ -179,13 +159,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             _render_symbol_report(
                 outcome=outcome,
-                feature_engine=feature_engine,
-                trend_scorer=trend_scorer,
-                momentum_scorer=momentum_scorer,
-                volatility_scorer=volatility_scorer,
-                scenario_engine=scenario_engine,
                 report_generator=report_generator,
-                model_mode=active_model_mode,
                 probability_model_config=probability_model_config,
                 prob_debug=args.prob_debug,
                 run_prob_ablation=args.prob_ablation,
@@ -214,26 +188,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _render_symbol_report(
     *,
     outcome: DataFetchOutcome,
-    feature_engine: FeatureEngine,
-    trend_scorer: TrendScorer,
-    momentum_scorer: MomentumScorer,
-    volatility_scorer: VolatilityScorer,
-    scenario_engine: ScenarioEngine,
     report_generator: ReportGenerator,
-    model_mode: str,
-    probability_model_config: Any | None,
+    probability_model_config: Any,
     prob_debug: bool,
     run_prob_ablation: bool,
 ) -> None:
     computed = _compute_analysis(
         outcome=outcome,
-        feature_engine=feature_engine,
-        trend_scorer=trend_scorer,
-        momentum_scorer=momentum_scorer,
-        volatility_scorer=volatility_scorer,
-        scenario_engine=scenario_engine,
         report_generator=report_generator,
-        model_mode=model_mode,
         probability_model_config=probability_model_config,
     )
 
@@ -261,11 +223,11 @@ def _render_symbol_report(
                 f"raw(上/下/不确定)="
                 f"{detail.display_prob_up_raw * 100:.2f}%/"
                 f"{detail.display_prob_down_raw * 100:.2f}%/"
-                f"{detail.display_prob_uncertain * 100:.2f}% "
+                f"{detail.display_prob_uncertain_raw * 100:.2f}% "
                 f"cal(上/下/不确定)="
                 f"{detail.display_prob_up_calibrated * 100:.2f}%/"
                 f"{detail.display_prob_down_calibrated * 100:.2f}%/"
-                f"{detail.display_prob_uncertain * 100:.2f}% "
+                f"{detail.display_prob_uncertain_calibrated * 100:.2f}% "
                 f"final(上/下/不确定)="
                 f"{detail.display_prob_up * 100:.2f}%/"
                 f"{detail.display_prob_down * 100:.2f}%/"
@@ -278,7 +240,12 @@ def _render_symbol_report(
                 f"top2={detail.top2_prob * 100:.2f}% "
                 f"margin={detail.margin * 100:.2f}% "
                 f"阈值=[{detail.threshold_down * 100:.2f}%, {detail.threshold_up * 100:.2f}%] "
-                f"regime={detail.regime} signal_strength={detail.signal_strength * 100:.1f}%"
+                f"regime={detail.regime} signal_strength={detail.signal_strength * 100:.1f}% "
+                f"boost_delta(regime/high/total)="
+                f"{detail.regime_shift_boost_delta * 100:.2f}%/"
+                f"{detail.high_vol_boost_delta * 100:.2f}%/"
+                f"{detail.total_uncertain_boost_delta * 100:.2f}% "
+                f"uncertain_ceiling_applied={'yes' if detail.uncertain_ceiling_applied else 'no'}"
             )
             if detail.warning_code:
                 print(
@@ -288,7 +255,7 @@ def _render_symbol_report(
                 )
     if prob_debug and computed.backtest_summary:
         _print_probability_debug_info(computed.backtest_summary)
-    if run_prob_ablation and outcome.candles and model_mode == "quantile":
+    if run_prob_ablation and outcome.candles:
         try:
             _run_probability_ablation(candles=outcome.candles, base_config=probability_model_config)
         except FeatureError as exc:
@@ -307,30 +274,21 @@ def _run_ui_mode(
     port: int,
     timezone: ZoneInfo,
     orchestrator: AnalysisOrchestrator,
-    feature_engine: FeatureEngine,
-    trend_scorer: TrendScorer,
-    momentum_scorer: MomentumScorer,
-    volatility_scorer: VolatilityScorer,
-    scenario_engine: ScenarioEngine,
+    repository: SQLiteRepository,
     report_generator: ReportGenerator,
     model_mode: str,
-    probability_model_config: Any | None,
+    probability_model_config: Any,
+    quote_provider: YahooFinanceQuoteProvider,
 ) -> int:
     logger.info("ui_server_start host=%s port=%s", host, port)
 
-    def build_dashboard(period: str, selected_model_mode: str) -> str:
+    def build_dashboard(period: str, _selected_model_mode: str) -> str:
         normalized_period = _normalize_ui_period(period)
-        normalized_model_mode = selected_model_mode.strip().lower()
-        if normalized_model_mode not in {"quantile", "legacy"}:
-            normalized_model_mode = model_mode
-        effective_model_mode = normalized_model_mode
+        normalized_model_mode = "quantile"
+        effective_model_mode = "quantile"
         ui_notice: str | None = None
-        if effective_model_mode == "quantile" and probability_model_config is None:
-            effective_model_mode = "legacy"
-            ui_notice = "quantile 依赖缺失，当前请求已自动切换为 legacy。"
         lookback_days = _ui_lookback_calendar_days(
             period=normalized_period,
-            model_mode=effective_model_mode,
             probability_model_config=probability_model_config,
         )
         end = datetime.now(timezone).date()
@@ -341,6 +299,11 @@ def _run_ui_mode(
             normalized_model_mode,
             effective_model_mode,
             lookback_days,
+        )
+        market_meta = _fetch_ui_market_meta(
+            quote_provider=quote_provider,
+            repository=repository,
+            logger=logger,
         )
 
         cards = []
@@ -354,32 +317,12 @@ def _run_ui_mode(
             try:
                 computed = _compute_analysis(
                     outcome=outcome,
-                    feature_engine=feature_engine,
-                    trend_scorer=trend_scorer,
-                    momentum_scorer=momentum_scorer,
-                    volatility_scorer=volatility_scorer,
-                    scenario_engine=scenario_engine,
                     report_generator=report_generator,
-                    model_mode=effective_model_mode,
                     probability_model_config=probability_model_config,
                 )
             except FeatureError as exc:
-                if effective_model_mode != "quantile":
-                    raise
-                logger.warning("ui_quantile_failed_fallback_to_legacy symbol=%s error=%s", symbol, exc)
-                effective_model_mode = "legacy"
-                ui_notice = f"quantile 运行失败，已自动切换为 legacy：{exc}"
-                computed = _compute_analysis(
-                    outcome=outcome,
-                    feature_engine=feature_engine,
-                    trend_scorer=trend_scorer,
-                    momentum_scorer=momentum_scorer,
-                    volatility_scorer=volatility_scorer,
-                    scenario_engine=scenario_engine,
-                    report_generator=report_generator,
-                    model_mode="legacy",
-                    probability_model_config=None,
-                )
+                logger.exception("ui_quantile_failed symbol=%s error=%s", symbol, exc)
+                raise
             card = build_index_card_view_model(
                 symbol=symbol,
                 period=normalized_period,
@@ -390,6 +333,8 @@ def _run_ui_mode(
                 data_status=outcome.data_status,
                 used_cache_fallback=outcome.used_cache_fallback,
                 horizon_outputs=computed.horizon_outputs,
+                latest_pe=market_meta.pe_by_symbol.get(symbol.upper()),
+                pe_source=market_meta.pe_source_by_symbol.get(symbol.upper()),
             )
             cards.append(card)
 
@@ -398,7 +343,9 @@ def _run_ui_mode(
             cards=cards,
             period=normalized_period,
             generated_at=generated_at,
-            model_mode=effective_model_mode,
+            vix_value=market_meta.vix,
+            vix_source=market_meta.vix_source,
+            model_mode="quantile",
             ui_notice=ui_notice,
         )
 
@@ -420,31 +367,13 @@ def _run_ui_mode(
 def _compute_analysis(
     *,
     outcome: DataFetchOutcome,
-    feature_engine: FeatureEngine,
-    trend_scorer: TrendScorer,
-    momentum_scorer: MomentumScorer,
-    volatility_scorer: VolatilityScorer,
-    scenario_engine: ScenarioEngine,
     report_generator: ReportGenerator,
-    model_mode: str,
-    probability_model_config: Any | None,
+    probability_model_config: Any,
 ) -> _ComputedAnalysis:
-    if model_mode == "quantile":
-        if probability_model_config is None:
-            raise FeatureError("概率模型配置不可用，请安装 quantile 依赖后重试。")
-        return _compute_analysis_quantile(
-            outcome=outcome,
-            report_generator=report_generator,
-            probability_model_config=probability_model_config,
-        )
-    return _compute_analysis_legacy(
+    return _compute_analysis_quantile(
         outcome=outcome,
-        feature_engine=feature_engine,
-        trend_scorer=trend_scorer,
-        momentum_scorer=momentum_scorer,
-        volatility_scorer=volatility_scorer,
-        scenario_engine=scenario_engine,
         report_generator=report_generator,
+        probability_model_config=probability_model_config,
     )
 
 
@@ -492,35 +421,6 @@ def _compute_analysis_quantile(
     )
 
 
-def _compute_analysis_legacy(
-    *,
-    outcome: DataFetchOutcome,
-    feature_engine: FeatureEngine,
-    trend_scorer: TrendScorer,
-    momentum_scorer: MomentumScorer,
-    volatility_scorer: VolatilityScorer,
-    scenario_engine: ScenarioEngine,
-    report_generator: ReportGenerator,
-) -> _ComputedAnalysis:
-    features = feature_engine.compute(outcome.candles)
-    trend_result = trend_scorer.score(features)
-    momentum_scores = momentum_scorer.score(features)
-    volatility_scores = volatility_scorer.score(features)
-    scenarios = scenario_engine.generate(
-        trend_scores=trend_result,
-        momentum_scores=momentum_scores,
-        volatility_scores=volatility_scores,
-    )
-    report = report_generator.generate(
-        symbol=outcome.symbol,
-        trend_signals=trend_result.signals,
-        scenario_probs=scenarios,
-        data_status=outcome.data_status,
-        used_cache_fallback=outcome.used_cache_fallback,
-    )
-    return _ComputedAnalysis(scenarios=scenarios, report=report)
-
-
 def _scenario_probs_from_horizon_outputs(
     outputs: dict[str, Any]
 ) -> list[ScenarioProbs]:
@@ -565,6 +465,11 @@ def _print_probability_debug_info(backtest_summary: dict[str, object]) -> None:
         raw_metrics = chain_metrics.get("raw", {})
         calibrated_metrics = chain_metrics.get("calibrated", {})
         final_metrics = chain_metrics.get("final", {})
+        recent_label_dist = diagnostics.get("recent_label_distribution", {})
+        train_by_regime = diagnostics.get("train_label_distribution_by_regime", {})
+        oof_by_regime = diagnostics.get("oof_label_distribution_by_regime", {})
+        threshold_uncertain_bins = diagnostics.get("threshold_uncertain_bins", [])
+        flip_summary = diagnostics.get("calibration_flip_summary", {})
         base_probs = diagnostics.get("base_probs", {})
         threshold_up_stats = diagnostics.get("threshold_up_stats", {})
         threshold_down_stats = diagnostics.get("threshold_down_stats", {})
@@ -607,6 +512,30 @@ def _print_probability_debug_info(backtest_summary: dict[str, object]) -> None:
             f"{q90_stats.get('p50', 0.0) * 100:.2f}% "
             f"sigma_p50={sigma_stats.get('p50', 0.0) * 100:.2f}%"
         )
+        if isinstance(recent_label_dist, dict) and recent_label_dist:
+            print(
+                f"  recent_window label(up/flat/down)="
+                f"{recent_label_dist.get('pct_up', 0.0) * 100:.1f}%/"
+                f"{recent_label_dist.get('pct_flat', 0.0) * 100:.1f}%/"
+                f"{recent_label_dist.get('pct_down', 0.0) * 100:.1f}%"
+            )
+        if isinstance(train_by_regime, dict) and train_by_regime:
+            print(f"  train_by_regime={train_by_regime}")
+        if isinstance(oof_by_regime, dict) and oof_by_regime:
+            print(f"  oof_by_regime={oof_by_regime}")
+        if isinstance(threshold_uncertain_bins, list) and threshold_uncertain_bins:
+            print(f"  threshold_vs_uncertain={threshold_uncertain_bins}")
+        if isinstance(flip_summary, dict) and flip_summary:
+            print(
+                "  calibration_flip "
+                f"rate={flip_summary.get('flip_rate', 0.0):.3f} "
+                f"count={int(flip_summary.get('flip_count', 0))} "
+                f"raw_top1={flip_summary.get('raw_top1_prob_mean', 0.0):.3f} "
+                f"cal_top1={flip_summary.get('cal_top1_prob_mean', 0.0):.3f} "
+                f"flip_logloss_improve={flip_summary.get('flip_logloss_improve_rate', 0.0):.3f} "
+                f"flip_brier_improve={flip_summary.get('flip_brier_improve_rate', 0.0):.3f} "
+                f"strong_to_uncertain={flip_summary.get('strong_direction_to_uncertain_rate', 0.0):.3f}"
+            )
         print(f"  confusion raw={raw_metrics.get('confusion_matrix', [])}")
         print(f"  confusion cal={calibrated_metrics.get('confusion_matrix', [])}")
         print(f"  confusion final={final_metrics.get('confusion_matrix', [])}")
@@ -630,7 +559,11 @@ def _print_probability_debug_info(backtest_summary: dict[str, object]) -> None:
                 f"enabled={binary_pipeline.get('enabled', False)} "
                 f"oof_dir_rows={int(binary_pipeline.get('directional_oof_rows', 0))} "
                 f"prob_cap={float(binary_pipeline.get('prob_cap', 0.0)):.2f} "
-                f"regime_shift_score={float(binary_pipeline.get('regime_shift_score', 0.0)):.3f}"
+                f"regime_shift_score={float(binary_pipeline.get('regime_shift_score', 0.0)):.3f} "
+                f"flip_rate={float(binary_pipeline.get('raw_to_cal_flip_rate', 0.0)):.3f} "
+                f"flip_thr={float(binary_pipeline.get('flip_rate_threshold', 0.0)):.3f} "
+                f"blend={float(binary_pipeline.get('blend_weight', 0.0)):.2f} "
+                f"max_shift={float(binary_pipeline.get('max_shift', 0.0)):.2f}"
             )
         _print_reliability_bins("raw prob_down", raw_metrics.get("calibration_down", []))
         _print_reliability_bins("raw prob_up", raw_metrics.get("calibration_up", []))
@@ -711,6 +644,7 @@ def _build_probability_model_config(runtime_config: RuntimeConfig) -> Any:
             k_5=prob.k_5,
             k_20=prob.k_20,
             k_60=prob.k_60,
+            long_high_vol_strong_trend_scale=prob.long_high_vol_strong_trend_scale,
         ),
         quantile=QuantileModelConfig(
             learning_rate=prob.quantile_lr,
@@ -732,6 +666,11 @@ def _build_probability_model_config(runtime_config: RuntimeConfig) -> Any:
             lambda_5=prob.lambda_5,
             lambda_20=prob.lambda_20,
             lambda_60=prob.lambda_60,
+            short_guard_enabled=prob.short_guard_enabled,
+            short_guard_margin=prob.short_guard_margin,
+            short_guard_uncertain_max=prob.short_guard_uncertain_max,
+            short_guard_mu_sigma_min=prob.short_guard_mu_sigma_min,
+            short_guard_alpha=prob.short_guard_alpha,
             calibration_blend_5=prob.calibration_blend_5,
             calibration_blend_20=prob.calibration_blend_20,
             calibration_blend_60=prob.calibration_blend_60,
@@ -758,7 +697,7 @@ def _build_parser(
     parser = argparse.ArgumentParser(description="IndexTrack CLI")
     parser.add_argument("--index", choices=["SP500", "NASDAQ", "BOTH"], default=default_index)
     parser.add_argument("--period", default=default_period)
-    parser.add_argument("--model", choices=["legacy", "quantile"], default=default_model)
+    parser.add_argument("--model", choices=["quantile"], default=default_model)
     parser.add_argument("--timezone", default=None)
     parser.add_argument("--db-path", default=".data/indextrack.db")
     parser.add_argument("--log-level", default="INFO")
@@ -796,21 +735,17 @@ def _normalize_ui_period(period: str) -> str:
 def _ui_lookback_calendar_days(
     *,
     period: str,
-    model_mode: str,
     probability_model_config: Any | None,
 ) -> int:
     display_trading_days = _period_to_trading_days(period)
     baseline = max(320, int(display_trading_days * 2.0))
-    if model_mode != "quantile":
-        return baseline
 
     min_train_size = 120
     min_valid_size = 20
-    if probability_model_config is not None:
-        split_config = getattr(probability_model_config, "split", None)
-        if split_config is not None:
-            min_train_size = int(getattr(split_config, "min_train_size", min_train_size))
-            min_valid_size = int(getattr(split_config, "min_valid_size", min_valid_size))
+    split_config = getattr(probability_model_config, "split", None)
+    if split_config is not None:
+        min_train_size = int(getattr(split_config, "min_train_size", min_train_size))
+        min_valid_size = int(getattr(split_config, "min_valid_size", min_valid_size))
 
     # 经验下限: 预留 long horizon(60) + 最大特征窗口(60) + 至少两段 valid fold。
     min_trading_days_for_quantile = max(
@@ -823,6 +758,166 @@ def _ui_lookback_calendar_days(
 
 def _horizon_label(horizon: str) -> str:
     return {"short": "短期", "mid": "中期", "long": "长期"}.get(horizon, horizon)
+
+
+def _fetch_ui_market_meta(
+    *,
+    quote_provider: YahooFinanceQuoteProvider,
+    repository: SQLiteRepository,
+    logger: logging.Logger,
+) -> DashboardMarketMeta:
+    normalized_symbols = [item.upper() for item in INDEX_MAP["BOTH"]]
+    pe_by_symbol: dict[str, float | None] = {symbol: None for symbol in normalized_symbols}
+    pe_source_by_symbol: dict[str, str] = {symbol: "unavailable" for symbol in normalized_symbols}
+    vix_value: float | None = None
+    vix_source = "unavailable"
+    notes: list[str] = []
+
+    try:
+        meta = quote_provider.fetch_dashboard_meta(normalized_symbols)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ui_quote_meta_failed error=%s", exc)
+        notes.append(f"quote_failed:{exc}")
+        meta = DashboardMarketMeta(
+            pe_by_symbol={symbol: None for symbol in normalized_symbols},
+            pe_source_by_symbol={symbol: "unavailable" for symbol in normalized_symbols},
+            vix=None,
+            vix_source="unavailable",
+            source="unavailable",
+            fetched_at=datetime.now(tz=timezone.utc),
+            note=str(exc),
+        )
+
+    now = datetime.now(tz=timezone.utc)
+    for symbol in normalized_symbols:
+        pe_candidate = meta.pe_by_symbol.get(symbol)
+        source_candidate = meta.pe_source_by_symbol.get(symbol, "unavailable")
+        if pe_candidate is not None:
+            pe_by_symbol[symbol] = pe_candidate
+            pe_source_by_symbol[symbol] = source_candidate
+            repository.save_market_meta(
+                key=f"PE_{symbol}",
+                value=pe_candidate,
+                source=source_candidate,
+                fetched_at=now,
+                note="ui_live",
+            )
+            continue
+        api_pe, api_source = quote_provider.fetch_pe_from_alpha_vantage(symbol)
+        if api_pe is not None:
+            pe_by_symbol[symbol] = api_pe
+            pe_source_by_symbol[symbol] = api_source
+            repository.save_market_meta(
+                key=f"PE_{symbol}",
+                value=api_pe,
+                source=api_source,
+                fetched_at=now,
+                note="ui_fallback_alpha_vantage",
+            )
+            continue
+        if api_source and "disabled" not in api_source and "missing" not in api_source:
+            notes.append(f"pe_api_failed:{symbol}:{api_source}")
+        cached = repository.load_market_meta(key=f"PE_{symbol}")
+        if cached is not None:
+            pe_by_symbol[symbol] = cached.value
+            pe_source_by_symbol[symbol] = f"cache:{cached.source}"
+            continue
+        seed_pe, seed_source = quote_provider.read_pe_from_seed(symbol)
+        if seed_pe is not None:
+            pe_by_symbol[symbol] = seed_pe
+            pe_source_by_symbol[symbol] = seed_source
+            repository.save_market_meta(
+                key=f"PE_{symbol}",
+                value=seed_pe,
+                source=seed_source,
+                fetched_at=now,
+                note="ui_seed_bootstrap",
+            )
+        else:
+            notes.append(f"pe_missing:{symbol}")
+
+    if meta.vix is not None:
+        vix_value = meta.vix
+        vix_source = meta.vix_source
+        repository.save_market_meta(
+            key="VIX",
+            value=vix_value,
+            source=vix_source,
+            fetched_at=now,
+            note="ui_live",
+        )
+    else:
+        alpha_vix, alpha_source = quote_provider.fetch_vix_from_alpha_vantage()
+        if alpha_vix is not None:
+            vix_value = alpha_vix
+            vix_source = alpha_source
+            repository.save_market_meta(
+                key="VIX",
+                value=vix_value,
+                source=vix_source,
+                fetched_at=now,
+                note="ui_fallback_alpha_vantage",
+            )
+        else:
+            if alpha_source and "disabled" not in alpha_source and "missing" not in alpha_source:
+                notes.append(f"alpha_vix_failed:{alpha_source}")
+            try:
+                fred_vix = quote_provider.fetch_vix_from_fred()
+                if fred_vix is not None:
+                    vix_value = fred_vix
+                    vix_source = "fred_vixcls_csv"
+                    repository.save_market_meta(
+                        key="VIX",
+                        value=vix_value,
+                        source=vix_source,
+                        fetched_at=now,
+                        note="ui_fallback_fred",
+                    )
+                else:
+                    notes.append("fred_vix_missing")
+            except Exception as exc:  # noqa: BLE001
+                notes.append(f"fred_vix_failed:{exc}")
+            if vix_value is None:
+                cached = repository.load_market_meta(key="VIX")
+                if cached is not None:
+                    vix_value = cached.value
+                    vix_source = f"cache:{cached.source}"
+                else:
+                    seed_vix, seed_source = quote_provider.read_vix_from_seed()
+                    if seed_vix is not None:
+                        vix_value = seed_vix
+                        vix_source = seed_source
+                        repository.save_market_meta(
+                            key="VIX",
+                            value=vix_value,
+                            source=vix_source,
+                            fetched_at=now,
+                            note="ui_seed_bootstrap",
+                        )
+                    else:
+                        notes.append("vix_missing")
+
+    if meta.note:
+        notes.append(meta.note)
+
+    final_meta = DashboardMarketMeta(
+        pe_by_symbol=pe_by_symbol,
+        pe_source_by_symbol=pe_source_by_symbol,
+        vix=vix_value,
+        vix_source=vix_source,
+        source=meta.source,
+        fetched_at=now,
+        note=" | ".join(notes) if notes else None,
+    )
+    logger.info(
+        "ui_quote_meta_resolved source=%s vix=%s vix_source=%s pe_sources=%s note=%s",
+        final_meta.source,
+        f"{final_meta.vix:.2f}" if final_meta.vix is not None else "N/A",
+        final_meta.vix_source,
+        final_meta.pe_source_by_symbol,
+        final_meta.note or "",
+    )
+    return final_meta
 
 
 def _friendly_error(exc: Exception) -> tuple[str, list[str]]:
@@ -840,8 +935,7 @@ def _friendly_error(exc: Exception) -> tuple[str, list[str]]:
     if "INDEXTRACK_" in raw:
         suggestions.append("请检查相关环境变量配置格式是否正确。")
     if "概率模型失败" in raw:
-        suggestions.append("可临时切换 --model legacy 验证是否为新模型样本不足。")
-        suggestions.append("或扩大分析周期（如 1Y/3Y）以提供更多训练样本。")
+        suggestions.append("可扩大分析周期（如 1Y/3Y）以提供更多训练样本。")
     if "OOF 样本不足" in raw:
         suggestions.append("可先运行 --period 1Y 刷新更长历史，再回到 UI 周期查看。")
         suggestions.append("如需对照旧参数，可设置 INDEXTRACK_PROB_PROFILE=baseline。")

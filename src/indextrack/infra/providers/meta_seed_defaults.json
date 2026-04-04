@@ -1,0 +1,8 @@
+{
+  "pe": {
+    "SP500": 24.8,
+    "NASDAQ": 32.6
+  },
+  "vix": 21.4,
+  "note": "Bundled fallback seed values for offline/blocked metadata requests."
+}

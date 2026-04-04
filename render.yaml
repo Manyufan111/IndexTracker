@@ -5,8 +5,6 @@ services:
     dockerfilePath: ./Dockerfile
     healthCheckPath: /healthz
     envVars:
-      - key: INDEXTRACK_DEPLOY_MODEL
-        value: quantile
       - key: INDEXTRACK_DEPLOY_PERIOD
         value: 1Y
       - key: INDEXTRACK_TIMEZONE

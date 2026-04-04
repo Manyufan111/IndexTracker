@@ -51,3 +51,8 @@
 
 ## 8. 已知限制（不阻塞 MVP）
 - 节假日日历覆盖 NYSE 常规休市日，但未覆盖临时停市（例如国家哀悼日等非常规事件）。
+
+## 9. 概率策略收口记录（2026-04）
+- `long`：保持 baseline（`raw-only`），不再默认启用 calibrator。
+- `short guard`：`v1/v2` 诊断未形成稳定收益，默认关闭并阶段性收口。
+- `short calibrator`：采用 `A1 simpler calibrator` 作为新默认（short conservative 校准 + 更温和温度缩放）。

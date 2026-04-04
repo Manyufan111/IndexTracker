@@ -18,6 +18,8 @@ def render_dashboard_page(
     cards: list[IndexCardViewModel],
     period: str,
     generated_at: str,
+    vix_value: float | None = None,
+    vix_source: str | None = None,
     model_mode: str = "quantile",
     ui_notice: str | None = None,
 ) -> str:
@@ -25,8 +27,10 @@ def render_dashboard_page(
     normalized_model = _normalize_model_mode(model_mode)
     cards_html = "".join(_render_card(item) for item in cards)
     period_tabs = _render_period_tabs(period=period, model_mode=normalized_model)
-    model_tabs = _render_model_tabs(period=period, model_mode=normalized_model)
+    model_tabs = ""
     notice_html = ""
+    vix_text = "N/A" if vix_value is None else f"{vix_value:.2f}"
+    vix_source_text = vix_source or "unavailable"
     if ui_notice:
         notice_html = f'<div class="notice">{escape(ui_notice)}</div>'
     return f"""<!doctype html>
@@ -71,14 +75,29 @@ def render_dashboard_page(
       color: var(--muted);
       font-size: 13px;
     }}
+    .header-right {{
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 4px;
+    }}
+    .vix {{
+      color: #9a3b00;
+      font-size: 13px;
+      background: #fff1e6;
+      border: 1px solid #ffd7bc;
+      border-radius: 999px;
+      padding: 3px 10px;
+    }}
+    .vix-source {{
+      color: var(--muted);
+      font-size: 12px;
+    }}
     .tabs {{
       display: flex;
       gap: 8px;
       margin: 12px 0 20px;
       flex-wrap: wrap;
-    }}
-    .tabs.model-tabs {{
-      margin-top: -8px;
     }}
     .tab {{
       padding: 6px 12px;
@@ -194,13 +213,28 @@ def render_dashboard_page(
       border-radius: 10px;
       padding: 18px;
     }}
+    .valuation-meta {{
+      margin-top: 8px;
+      color: #3a556f;
+      font-size: 12px;
+      font-weight: 600;
+    }}
+    .valuation-source {{
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 11px;
+    }}
   </style>
 </head>
 <body>
   <main class="container">
     <header class="header">
       <h1>IndexTrack 趋势总览</h1>
-      <div class="meta">生成时间：{escape(generated_at)}</div>
+      <div class="header-right">
+        <div class="vix">恐慌指数 VIX：{escape(vix_text)}</div>
+        <div class="vix-source">VIX 来源：{escape(vix_source_text)}</div>
+        <div class="meta">生成时间：{escape(generated_at)}</div>
+      </div>
     </header>
     {period_tabs}
     {model_tabs}
@@ -280,6 +314,8 @@ def _render_card(card: IndexCardViewModel) -> str:
 <section class="card">
   <h2>{escape(card.title)}（{escape(card.period)}）</h2>
   {chart_html}
+  <div class="valuation-meta">{escape(card.pe_line)}</div>
+  <div class="valuation-source">{escape(card.pe_source_line)}</div>
   {analysis_html}
   {disclosure_html}
 </section>
@@ -299,19 +335,5 @@ def _render_period_tabs(*, period: str, model_mode: str) -> str:
     return "".join(html)
 
 
-def _render_model_tabs(*, period: str, model_mode: str) -> str:
-    options = [("quantile", "Quantile 模型"), ("legacy", "Legacy 模型")]
-    html = ['<nav class="tabs model-tabs" aria-label="模型选择">']
-    for value, label in options:
-        class_name = "tab active" if value == model_mode else "tab"
-        href = f"/?period={period}&model={value}"
-        html.append(f'<a class="{class_name}" href="{href}">{label}</a>')
-    html.append("</nav>")
-    return "".join(html)
-
-
 def _normalize_model_mode(value: str) -> str:
-    cleaned = value.strip().lower()
-    if cleaned in {"quantile", "legacy"}:
-        return cleaned
     return "quantile"
