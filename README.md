@@ -10,6 +10,7 @@ pinned: false
 # IndexTrack
 
 IndexTrack 是一个本地工具，可分析 `S&P 500` 与 `Nasdaq Composite`，输出短/中/长期趋势概率和中文结论。
+可直接使用的Web版本：https://huggingface.co/spaces/Nick3314/IndexTrack
 
 ## 先跑起来（中文）
 
